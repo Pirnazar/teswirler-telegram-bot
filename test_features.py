@@ -431,6 +431,240 @@ class FeatureBotTests(unittest.IsolatedAsyncioTestCase):
         await self.app.handle(callback(111,'reply:room'))
         self.assertFalse(self.app.pending_actions)
 
+    def quoted_reply(self, text, message_id=777, token=None, chat=111):
+        update = message(chat, text)
+        original = {'message_id': message_id, 'date': time.time(),
+                    'chat': {'id': chat, 'type': 'private'},
+                    'from': {'id': self.app.bot.id, 'is_bot': True, 'first_name': 'Test bot'},
+                    'text': 'Untrusted display text'}
+        if token:
+            original['reply_markup'] = {'inline_keyboard': [[{'text': 'Reply', 'callback_data': 'reply:' + token}]]}
+        update['message']['reply_to_message'] = original
+        return update
+
+    async def native_draft(self, update):
+        await self.app.handle(update)
+        await self.app.dispatch_features()
+        await self.finish()
+        state = await self.app.get_conversation(111)
+        self.assertEqual(state['step'], 'reply_confirm')
+        self.assertEqual(state['name'], 'Verified person')
+        self.assertFalse(ActionSite.posts)
+        return state
+
+    async def test_native_reply_uses_persisted_delivery_after_restart_without_markup(self):
+        self.target_token()
+        self.app.catalog.update(111, next_poll=time.time()+3600, digest_enabled=0)
+        user = self.app.catalog.user(111)
+        await self.app.poll_job(user, threading.Event())
+        store = self.app.feature_store(user)
+        try:
+            delivered_id = store.db.execute('SELECT message_id FROM telegram_messages').fetchone()[0]
+            self.assertFalse(store.db.execute('SELECT 1 FROM outbox').fetchone())
+        finally:
+            store.db.close()
+        await self.app.close()
+        self.telegram = FakeTelegram()
+        self.app = PublicBot(Path(self.temp.name), self.telegram, ActionSite)
+        self.addAsyncCleanup(self.app.close)
+        state = await self.native_draft(self.quoted_reply('Native answer', message_id=delivered_id))
+        self.assertEqual(state['text'], 'Native answer')
+        await self.app.handle(callback(111, 'send:' + state['nonce']))
+        await self.app.dispatch_features()
+        await self.finish()
+        self.assertEqual(ActionSite.posts, [('one','/conversations/room/messages',{'content':'Native answer'})])
+
+    async def test_native_reply_supports_existing_cards_and_keeps_menu_label_as_text(self):
+        from i18n import tr
+        text = tr('ru', 'nav_settings')
+        state = await self.native_draft(self.quoted_reply(text, token=self.target_token()))
+        self.assertEqual(state['text'], text)
+        self.assertTrue(any('inline_keyboard' in body.get('reply_markup', {}) and 'send:' in str(body)
+                            for method, body in self.telegram.calls if method == 'sendMessage'))
+
+    async def test_native_reply_supersedes_another_recipient_draft(self):
+        old_nonce = await self.prepare_draft()
+        ActionSite.conversations['one']['another-room'] = {'id':'another-room', 'participants':[{'id':'another-peer', 'name':'Another person'}]}
+        user = self.app.catalog.user(111)
+        store = self.app.feature_store(user)
+        try:
+            store.queue_recent([notification('another',type='MESSAGE',conversationId='another-room')], user, time.time())
+            token = store.db.execute("SELECT token FROM reply_targets WHERE conversation_id='another-room'").fetchone()[0]
+        finally:
+            store.db.close()
+        await self.app.handle(self.quoted_reply('Answer another person', token=token))
+        await self.app.dispatch_features()
+        await self.finish()
+        state = await self.app.get_conversation(111)
+        self.assertEqual(state['conversation_id'], 'another-room')
+        self.assertEqual(state['name'], 'Another person')
+        await self.app.handle(callback(111, 'send:' + old_nonce))
+        self.assertFalse(self.app.pending_actions)
+        await self.app.handle(callback(111, 'send:' + state['nonce']))
+        await self.app.dispatch_features()
+        await self.finish()
+        self.assertEqual(ActionSite.posts[0][1], '/conversations/another-room/messages')
+
+    async def test_native_reply_rejects_forward_and_non_bot_source_without_deleting_text(self):
+        token = self.target_token()
+        for kind in ('forward', 'human', 'foreign_bot', 'foreign_chat'):
+            update = self.quoted_reply('Keep my draft', token=token)
+            original = update['message']['reply_to_message']
+            if kind == 'forward':
+                original['forward_origin'] = {'type':'hidden_user', 'date':time.time(), 'sender_user_name':'Someone'}
+            elif kind == 'human':
+                original['from']['is_bot'] = False
+            elif kind == 'foreign_bot':
+                original['from']['id'] = 999999
+            else:
+                original['chat']['id'] = 222
+            before = len(self.telegram.calls)
+            await self.app.handle(update)
+            self.assertFalse(self.app.pending_actions)
+            self.assertFalse(any(method == 'deleteMessage' for method, body in self.telegram.calls[before:]))
+        self.assertFalse(ActionSite.posts)
+
+    async def test_native_reply_cross_account_token_and_unknown_quote_do_not_guess_target(self):
+        token = self.target_token()
+        await self.connect(222, 'two')
+        await self.app.handle(self.quoted_reply('Wrong account', token=token, chat=222))
+        await self.app.dispatch_features()
+        await self.finish(222, raises=True)
+        self.assertIsNone(await self.app.get_conversation(222))
+        await self.app.handle(self.quoted_reply('Unknown notification'))
+        await self.app.dispatch_features()
+        await self.finish(raises=True)
+        self.assertIsNone(await self.app.get_conversation(111))
+        self.assertFalse(ActionSite.posts)
+
+    async def test_known_expired_message_does_not_fall_back_to_fresh_token(self):
+        token = self.target_token()
+        store = self.app.feature_store(self.app.catalog.user(111))
+        try:
+            with store.db:
+                store.db.execute('INSERT INTO telegram_messages VALUES (?,?,?)', (777, token, time.time()-1))
+        finally:
+            store.db.close()
+        await self.app.handle(self.quoted_reply('Too old', token=token))
+        await self.app.dispatch_features()
+        await self.finish(raises=True)
+        self.assertIsNone(await self.app.get_conversation(111))
+
+    async def test_old_card_cannot_be_revived_by_a_refreshed_conversation_token(self):
+        update = self.quoted_reply('Old notification', token=self.target_token())
+        update['message']['reply_to_message']['date'] = time.time() - 8 * 86400
+        await self.app.handle(update)
+        self.assertFalse(self.app.pending_actions)
+        self.assertFalse(ActionSite.posts)
+
+    async def test_native_reply_rejects_attachment_and_oversized_text(self):
+        token = self.target_token()
+        for text in ('', '😀'*2001):
+            await self.app.handle(self.quoted_reply(text, token=token))
+            self.assertFalse(self.app.pending_actions)
+        self.assertFalse(ActionSite.posts)
+
+    async def test_native_reply_does_not_replace_a_confirmed_pending_send(self):
+        nonce = await self.prepare_draft()
+        await self.app.handle(callback(111, 'send:' + nonce))
+        original = self.app.pending_actions[111]
+        await self.app.handle(self.quoted_reply('Different answer', token=self.target_token()))
+        self.assertEqual(self.app.pending_actions[111], original)
+        await self.app.handle(message(111, '/cancel'))
+        self.assertFalse(ActionSite.posts)
+
+    async def test_native_reply_during_login_remains_a_credential(self):
+        token = self.target_token()
+        await self.app.handle(message(222, '/connect'))
+        await self.app.handle(self.quoted_reply('two', token=token, chat=222))
+        self.assertEqual((await self.app.get_conversation(222))['step'], 'password')
+        before = len(self.telegram.calls)
+        await self.app.handle(self.quoted_reply('password-not-stored', token=token, chat=222))
+        self.assertEqual(self.telegram.calls[before][0], 'deleteMessage')
+        self.assertFalse(self.app.pending_actions)
+        await self.finish(222)
+        self.assertEqual(self.app.catalog.user(222)['site_user'], 'two')
+        self.assertFalse(ActionSite.posts)
+
+    async def test_reply_to_an_expired_password_prompt_is_deleted(self):
+        from i18n import tr
+        update = self.quoted_reply('password-after-restart')
+        update['message']['reply_to_message']['text'] = tr('tk', 'password')
+        before = len(self.telegram.calls)
+        await self.app.handle(update)
+        self.assertEqual(self.telegram.calls[before][0], 'deleteMessage')
+        self.assertFalse(self.app.pending_actions)
+        self.assertIsNone(await self.app.get_conversation(111))
+
+    async def test_native_reply_to_reply_prompt_or_preview_edits_verified_draft(self):
+        await self.action('prepare_reply', {'token':self.target_token()})
+        state = await self.app.get_conversation(111)
+        prompt_id = state['prompt_message_ids'][-1]
+        await self.app.handle(self.quoted_reply('Reply to the prompt', message_id=prompt_id))
+        state = await self.app.get_conversation(111)
+        self.assertEqual(state['text'], 'Reply to the prompt')
+        old_nonce = state['nonce']
+        await self.app.handle(self.quoted_reply('Reply to the preview', message_id=state['prompt_message_ids'][-1]))
+        state = await self.app.get_conversation(111)
+        self.assertEqual(state['text'], 'Reply to the preview')
+        self.assertNotEqual(state['nonce'], old_nonce)
+        self.assertFalse(self.app.pending_actions)
+        self.assertFalse(ActionSite.posts)
+
+    async def test_delivery_of_legacy_payload_drains_without_recording_a_reply_target(self):
+        user = self.app.catalog.user(111)
+        user.update(next_poll=time.time()+3600, digest_enabled=0)
+        store = self.app.feature_store(user)
+        try:
+            with store.db:
+                store.db.execute("INSERT INTO outbox(text,payload,kind,due) VALUES (?,?,?,?)", ('Legacy plain text','invalid json','manual',0))
+        finally:
+            store.db.close()
+        await self.app.poll_job(user, threading.Event())
+        store = self.app.feature_store(user)
+        try:
+            self.assertFalse(store.db.execute('SELECT 1 FROM outbox').fetchone())
+            self.assertFalse(store.db.execute('SELECT 1 FROM telegram_messages').fetchone())
+        finally:
+            store.db.close()
+
+    async def test_persistent_keyboard_changes_language_and_pause_state(self):
+        from i18n import tr
+        await self.app.handle(message(111, '/menu'))
+        keyboard = self.telegram.calls[-1][1]['reply_markup']
+        self.assertTrue(keyboard['is_persistent'])
+        self.assertTrue(keyboard['resize_keyboard'])
+        self.assertFalse(keyboard['one_time_keyboard'])
+        self.assertEqual(len(keyboard['keyboard']), 3)
+        self.assertLessEqual(len(keyboard['input_field_placeholder']), 64)
+        await self.app.handle(message(111, tr('ru', 'nav_pause')))
+        self.assertFalse(self.app.catalog.user(111)['enabled'])
+        self.assertEqual(self.telegram.calls[-1][1]['reply_markup']['keyboard'][2][0]['text'], tr('ru','nav_resume'))
+        await self.app.handle(callback(111, 'lang_tk'))
+        self.assertEqual(self.telegram.calls[-1][1]['reply_markup']['keyboard'][0][0]['text'], tr('tk','nav_recent'))
+        await self.app.handle(message(111, tr('ru', 'nav_resume')))
+        self.assertTrue(self.app.catalog.user(111)['enabled'])
+        await self.app.handle(message(111, tr('tk', 'nav_recent')))
+        self.assertEqual(self.telegram.calls[-1][1]['text'], tr('tk', 'recent_choose'))
+        await self.app.handle(message(111, tr('tk', 'nav_settings')))
+        self.assertIn('disconnect', str(self.telegram.calls[-1][1]['reply_markup']))
+
+    async def test_dialog_cancel_and_menu_restore_normal_keyboard(self):
+        from i18n import tr
+        await self.app.handle(message(222, '/connect'))
+        keyboard = self.telegram.calls[-1][1]['reply_markup']['keyboard']
+        self.assertEqual(keyboard, [[{'text':tr('ru','nav_cancel')}, {'text':tr('ru','nav_menu')}]])
+        await self.app.handle(message(222, tr('ru','nav_cancel')))
+        self.assertIsNone(await self.app.get_conversation(222))
+        self.assertEqual(self.telegram.calls[-1][1]['reply_markup']['keyboard'][2][0]['text'], tr('ru','nav_connect'))
+        nonce = await self.prepare_draft()
+        await self.app.handle(message(111, tr('ru', 'nav_menu')))
+        self.assertIsNone(await self.app.get_conversation(111))
+        self.assertEqual(len(self.telegram.calls[-1][1]['reply_markup']['keyboard']),3)
+        await self.app.handle(callback(111, 'send:' + nonce))
+        self.assertFalse(self.app.pending_actions)
+        self.assertFalse(ActionSite.posts)
+
 
 class WriteTransportTests(unittest.TestCase):
     def test_post_never_retries_network_or_server_error(self):

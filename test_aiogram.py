@@ -13,7 +13,7 @@ from aiogram import Bot
 from aiogram.client.session.base import BaseSession
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from aiogram.methods import GetMe, GetUpdates, GetWebhookInfo, SendMessage
-from aiogram.types import Chat, Message, Update, User, WebhookInfo
+from aiogram.types import Chat, InlineKeyboardMarkup, Message, Update, User, WebhookInfo
 
 from bot import ServiceError, read_json
 from public_bot import PublicBot
@@ -41,7 +41,7 @@ class RecordingSession(BaseSession):
         if isinstance(method,SendMessage):
             return Message(message_id=len(self.methods),date=datetime.now(timezone.utc),
                            chat=Chat(id=int(method.chat_id),type='private'),text=method.text,
-                           reply_markup=method.reply_markup)
+                           reply_markup=method.reply_markup if isinstance(method.reply_markup, InlineKeyboardMarkup) else None)
         if isinstance(method,GetUpdates):
             await asyncio.sleep(.01)
             return [update for update in self.updates if update.update_id >= (method.offset or 0)]
@@ -75,6 +75,16 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             await self.gateway.call('getMe')
         self.assertNotIn('SECRET',str(caught.exception))
         self.assertEqual(caught.exception.status,0)
+
+    async def test_typed_persistent_reply_keyboard(self):
+        from aiogram.types import ReplyKeyboardMarkup
+        await self.gateway.call('sendMessage', {'chat_id':111, 'text':'Menu', 'reply_markup':{
+            'keyboard': [[{'text':'Settings'}]], 'is_persistent':True, 'resize_keyboard':True,
+            'one_time_keyboard':False, 'input_field_placeholder':'Choose an action'}})
+        keyboard = self.session.methods[-1].reply_markup
+        self.assertIsInstance(keyboard, ReplyKeyboardMarkup)
+        self.assertTrue(keyboard.is_persistent)
+        self.assertFalse(keyboard.one_time_keyboard)
 
     async def test_retry_after_is_preserved_without_automatic_send_retry(self):
         self.session.error=TelegramRetryAfter(method=SendMessage(chat_id=111,text='test'),message='slow down',retry_after=8)

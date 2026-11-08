@@ -25,7 +25,7 @@ from aiogram.filters import CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.base import StorageKey
 from aiogram.types import Message, CallbackQuery, Update
-from telegram_runtime import AiogramGateway, Conversation, InitialOffset, dispatcher_for
+from telegram_runtime import AiogramGateway, COMMANDS, Conversation, InitialOffset, dispatcher_for
 
 from bot import (ROOT, PRIVATE, LOG, ServiceError, Teswirler,
                  read_json, single_instance, queued_message, timezone_label)
@@ -209,19 +209,33 @@ class PublicBot(FeatureUI):
 
     def menu(self, user):
         lang = user['language']
-        def button(key):
-            return {'text': tr(lang, key), 'callback_data': key}
-        return {'inline_keyboard': [[button('recent'), button('summary')],
-                                    [button('status'), button('pause' if user['enabled'] else 'resume')],
-                                    [button('settings'), button('connect')],
-                                    [button('language'), button('timezone')],
-                                    [button('disconnect')]]}
+        control = ('pause' if user['enabled'] else 'resume') if user['site_user'] and user['status'] != 'expired' else 'connect'
+        return self.reply_keyboard(lang, [('recent', 'summary'), ('status', 'settings'), (control, 'language')])
+
+    @staticmethod
+    def reply_keyboard(language, rows):
+        return {'keyboard': [[{'text': tr(language, 'nav_' + key)} for key in row] for row in rows],
+                'resize_keyboard': True, 'is_persistent': True, 'one_time_keyboard': False,
+                'input_field_placeholder': tr(language, 'input_hint')}
+
+    def dialog_keyboard(self, user):
+        return self.reply_keyboard(user['language'], [('cancel', 'menu')])
+
+    @staticmethod
+    def navigation_command(text):
+        for lang in ('ru', 'tk'):
+            for command in ('recent', 'summary', 'status', 'settings', 'pause', 'resume', 'connect', 'language', 'cancel', 'menu'):
+                if text == tr(lang, 'nav_' + command):
+                    return command
+        return None
 
     async def send(self, chat_id, key, *, keyboard=None, **values):
         user = self.catalog.user(chat_id)
+        if keyboard is None:
+            keyboard = self.dialog_keyboard(user) if await self.get_conversation(chat_id) else self.menu(user)
         return await self.telegram.call('sendMessage', {
             'chat_id': chat_id, 'text': tr(user['language'], key, **values),
-            'reply_markup': keyboard if keyboard is not None else self.menu(user),
+            'reply_markup': keyboard,
             'link_preview_options': {'is_disabled': True},
         })
 
@@ -253,7 +267,7 @@ class PublicBot(FeatureUI):
         self.pending_actions[chat_id] = (action, dict(values), user['storage'])
         key = {'recent': 'recent_loading', 'summary': 'summary_loading',
                'prepare_reply': 'reply_preparing', 'send_reply': 'reply_sending'}[action]
-        await self.send(chat_id, key)
+        await self.send(chat_id, key, keyboard=self.dialog_keyboard(user) if action == 'prepare_reply' else None)
 
     async def dispatch_features(self):
         for chat_id, (action, values, storage) in list(self.pending_actions.items()):
@@ -283,17 +297,19 @@ class PublicBot(FeatureUI):
         user = self.catalog.user(chat_id)
         if chat_id in self.removing:
             return await self.send(chat_id, 'disconnecting')
-        if command == 'cancel' and self.pending_actions.get(chat_id, (None,))[0] == 'send_reply':
+        if command in ('cancel', 'menu') and self.pending_actions.get(chat_id, (None,))[0] == 'send_reply':
             self.pending_actions.pop(chat_id, None)
             await self.clear_conversation(chat_id)
-            return await self.send(chat_id, 'cancelled')
-        if command == 'cancel' and chat_id in self.jobs and self.jobs[chat_id].kind == 'feature:send_reply':
+            return await self.send(chat_id, 'menu_text' if command == 'menu' else 'cancelled')
+        if command in ('cancel', 'menu') and chat_id in self.jobs and self.jobs[chat_id].kind == 'feature:send_reply':
             return await self.send(chat_id, 'request_busy')
         if command in ('settings', 'filters', 'quiet', 'grouping', 'digest', 'recent', 'summary'):
             await self.cancel_input(chat_id)
             return await self.feature_command(chat_id, command, argument)
-        if command in ('start', 'language', 'timezone', 'cancel'):
+        if command in ('start', 'menu', 'language', 'timezone', 'cancel'):
             await self.cancel_input(chat_id)
+        if command == 'menu':
+            return await self.send(chat_id, 'menu_text')
         if command in ('start', 'language'):
             return await self.languages(chat_id)
         if command == 'timezone':
@@ -311,8 +327,7 @@ class PublicBot(FeatureUI):
             if user['site_user'] and user['status'] != 'expired':
                 return await self.send(chat_id, 'already')
             await self.set_conversation(chat_id, {'step': 'login', 'expires': time.time() + INPUT_TTL})
-            return await self.send(chat_id, 'login', keyboard={'inline_keyboard': [[
-                {'text': tr(user['language'], 'cancel'), 'callback_data': 'cancel'}]]})
+            return await self.send(chat_id, 'login')
         if command == 'status':
             if not user['site_user']:
                 return await self.send(chat_id, 'not_connected')
@@ -405,6 +420,46 @@ class PublicBot(FeatureUI):
             return await self.set_timezone(chat_id, command.args)
         return await self.command(chat_id, command.command, (command.args or '').strip())
 
+    async def on_navigation(self, message: Message, navigation: str):
+        chat_id = message.chat.id
+        self.register_sender(chat_id, message.from_user)
+        if navigation not in ('cancel', 'menu'):
+            await self.cancel_input(chat_id)
+        return await self.command(chat_id, navigation)
+
+    async def on_native_reply(self, message: Message):
+        chat_id = message.chat.id
+        self.register_sender(chat_id, message.from_user)
+        original = message.reply_to_message
+        if (not original.from_user or not original.from_user.is_bot or original.from_user.id != self.bot.id
+                or original.chat.id != chat_id or original.forward_origin or original.is_automatic_forward):
+            return await self.send(chat_id, 'reply_unavailable')
+        if original.text in {tr(lang, key) for lang in ('ru', 'tk') for key in ('login', 'password')}:
+            # A reply to an expired login prompt can still contain a password.
+            await self.clear_conversation(chat_id)
+            return await self.on_text(message, self.state(chat_id))
+        if original.date.timestamp() < time.time() - 7 * 86400:
+            return await self.send(chat_id, 'reply_unavailable')
+        state = await self.get_conversation(chat_id)
+        if state and original.message_id in state.get('prompt_message_ids', []):
+            return await self.feature_input(chat_id, message)
+        text = message.text or ''
+        if not text.strip() or len(text.encode('utf-16-le')) // 2 > 4000:
+            return await self.send(chat_id, 'reply_invalid')
+        if chat_id in self.pending_actions or chat_id in self.jobs and self.jobs[chat_id].kind != 'poll':
+            return await self.send(chat_id, 'request_busy')
+        # Older cards have no persisted delivery mapping. Only accept their own
+        # opaque reply token, never infer a recipient from quoted content or URLs.
+        token = None
+        if original.reply_markup:
+            for row in original.reply_markup.inline_keyboard:
+                for button in row:
+                    if re.fullmatch(r'reply:[0-9a-f]{24}', button.callback_data or ''):
+                        token = button.callback_data[6:]
+        await self.cancel_input(chat_id)
+        return await self.submit_feature(chat_id, 'prepare_reply', {
+            'telegram_message_id': original.message_id, 'fallback_token': token, 'draft_text': text})
+
     async def on_callback(self, callback: CallbackQuery):
         message = callback.message
         chat_id = message.chat.id
@@ -451,8 +506,7 @@ class PublicBot(FeatureUI):
             if not text.strip() or len(text.strip()) > 254:
                 return await self.send(chat_id, 'invalid_login')
             await self.set_conversation(chat_id, {'step': 'password', 'identifier': text.strip(), 'expires': time.time() + INPUT_TTL})
-            return await self.send(chat_id, 'password', keyboard={'inline_keyboard': [[
-                {'text': tr(self.catalog.user(chat_id)['language'], 'cancel'), 'callback_data': 'cancel'}]]})
+            return await self.send(chat_id, 'password')
         if conversation['step'] == 'password':
             if not text or len(text) > 1024:
                 return await self.send(chat_id, 'invalid_password')
@@ -509,11 +563,12 @@ class PublicBot(FeatureUI):
         finally:
             store.db.close()
 
-    def complete_poll(self, user, next_poll, sent_seq):
+    def complete_poll(self, user, next_poll, sent_seq, telegram_message_id=None):
         store = self.feature_store(user)
         try:
             if sent_seq is not None:
                 with store.db:
+                    store.remember_delivery(sent_seq, telegram_message_id, time.time())
                     store.db.execute('DELETE FROM outbox WHERE seq=?', (sent_seq,))
             pending, manual, due = store.pending(user, time.time())
             return next_poll, int(sent_seq is not None), pending, manual, due
@@ -524,10 +579,12 @@ class PublicBot(FeatureUI):
         loop = asyncio.get_running_loop()
         next_poll, row = await loop.run_in_executor(self.executor, self.prepare_poll, user, cancel)
         sent_seq = None
+        telegram_message_id = None
         if row and not cancel.is_set():
-            await self.telegram.call('sendMessage', {'chat_id': user['chat_id'], **queued_message(row[1], row[2])})
+            delivered = await self.telegram.call('sendMessage', {'chat_id': user['chat_id'], **queued_message(row[1], row[2])})
             sent_seq = row[0]
-        return await loop.run_in_executor(self.executor, self.complete_poll, user, next_poll, sent_seq)
+            telegram_message_id = delivered['message_id']
+        return await loop.run_in_executor(self.executor, self.complete_poll, user, next_poll, sent_seq, telegram_message_id)
 
     async def finish_login(self, chat_id, result, job):
         directory = result['directory']
@@ -603,7 +660,7 @@ class PublicBot(FeatureUI):
 
     async def safe_send(self, chat_id, key, **values):
         try:
-            await self.send(chat_id, key, **values)
+            return await self.send(chat_id, key, **values)
         except ServiceError:
             LOG.warning('Interface message could not be delivered')
 
@@ -661,17 +718,15 @@ class PublicBot(FeatureUI):
         self.catalog.meta('legacy_imported', '1')
 
     async def configure(self):
-        if self.catalog.meta('interface_version') == '3':
+        if self.catalog.meta('interface_version') == '4':
             return
         for language in ('', 'ru', 'tk'):
             lang = language or 'ru'
-            commands = [{'command': command, 'description': tr(lang, 'command_' + command)} for command in
-                        ('start', 'connect', 'recent', 'summary', 'settings', 'filters', 'quiet', 'grouping', 'digest',
-                         'status', 'pause', 'resume', 'language', 'timezone', 'disconnect', 'cancel', 'help')]
+            commands = [{'command': command, 'description': tr(lang, 'command_' + command)} for command in COMMANDS]
             await self.telegram.call('setMyCommands', {'commands': commands, 'language_code': language})
             await self.telegram.call('setMyDescription', {'description': tr(lang, 'description'), 'language_code': language})
             await self.telegram.call('setMyShortDescription', {'short_description': tr(lang, 'short_description'), 'language_code': language})
-        self.catalog.meta('interface_version', '3')
+        self.catalog.meta('interface_version', '4')
 
     async def worker_loop(self):
         while True:

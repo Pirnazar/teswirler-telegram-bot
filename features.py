@@ -103,6 +103,9 @@ class FeatureStore(Store):
             CREATE TABLE IF NOT EXISTS reply_sends (
                 nonce TEXT PRIMARY KEY, status TEXT NOT NULL, created REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS telegram_messages (
+                message_id INTEGER PRIMARY KEY, reply_token TEXT NOT NULL, expires REAL NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS notification_revisions (
                 notification_id TEXT NOT NULL, revision TEXT NOT NULL,
                 PRIMARY KEY(notification_id,revision)
@@ -181,6 +184,7 @@ class FeatureStore(Store):
         self.db.execute('DELETE FROM activity WHERE at<?', (now - 90 * 86400,))
         self.db.execute('DELETE FROM reply_targets WHERE expires<?', (now,))
         self.db.execute('DELETE FROM reply_sends WHERE created<?', (now - 30 * 86400,))
+        self.db.execute('DELETE FROM telegram_messages WHERE expires<?', (now - 30 * 86400,))
         return events
 
     def card(self, notification, user, now):
@@ -267,6 +271,29 @@ class FeatureStore(Store):
     def reply_target(self, token, now):
         row = self.db.execute('SELECT conversation_id,name FROM reply_targets WHERE token=? AND expires>?', (token, now)).fetchone()
         return {'conversation_id': row[0], 'name': row[1]} if row else None
+
+    def remember_delivery(self, seq, message_id, now):
+        """Bind a confirmed Telegram delivery to this account's trusted card."""
+        if not isinstance(message_id, int) or message_id <= 0:
+            return
+        row = self.db.execute('SELECT text,payload FROM outbox WHERE seq=?', (seq,)).fetchone()
+        if not row:
+            return
+        payload = queued_message(row[0], row[1])
+        for buttons in payload.get('reply_markup', {}).get('inline_keyboard', []):
+            for button in buttons:
+                data = button.get('callback_data', '')
+                if data.startswith('reply:') and self.reply_target(data[6:], now):
+                    self.db.execute('INSERT OR REPLACE INTO telegram_messages VALUES (?,?,?)',
+                                    (message_id, data[6:], now + 7 * 86400))
+                    return
+
+    def reply_message_token(self, message_id, fallback, now):
+        row = self.db.execute('SELECT reply_token,expires FROM telegram_messages WHERE message_id=?', (message_id,)).fetchone()
+        # A known expired message must not be revived by its old inline markup.
+        if row:
+            return row[0] if row[1] > now else None
+        return fallback
 
     def summary(self, user, start, end, *, respect_filters=False):
         language = user.get('language', 'ru')

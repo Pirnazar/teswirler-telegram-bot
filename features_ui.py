@@ -62,6 +62,7 @@ class FeatureUI:
             await self.feature_panel(chat_id, 'settings_text', {'inline_keyboard': [
                 [button('filters'), button('quiet')], [button('grouping'), button('digest')],
                 [button('timezone'), button('language')],
+                [button('disconnect')],
             ]}, message_id, count=8-len(muted_categories(user)), quiet=quiet,
                 grouping=tr(lang, 'on' if user['grouping'] else 'off'), digest=digest,
                 zone=timezone_label(user['timezone_minutes']))
@@ -175,21 +176,32 @@ class FeatureUI:
             await self.send(chat_id, 'reply_stale')
             return True
         text = message.text or ''
+        return await self.confirm_reply(chat_id, state, text)
+
+    async def confirm_reply(self, chat_id, state, text):
         if not text.strip() or len(text.encode('utf-16-le')) // 2 > 4000:
             await self.send(chat_id, 'reply_invalid')
             return True
         lang = self.catalog.user(chat_id)['language']
         nonce = secrets.token_hex(12)
-        await self.set_conversation(chat_id, {**state, 'step': 'reply_confirm', 'text': text, 'nonce': nonce,
-                                'expires': time.time() + 600})
+        confirmed = {**state, 'step': 'reply_confirm', 'text': text, 'nonce': nonce, 'expires': time.time() + 600}
+        await self.set_conversation(chat_id, confirmed)
         preview = (f'<b>{html.escape(tr(lang,"reply_confirm_title"))}</b>\n'
                    + escaped_excerpt(tr(lang, 'reply_recipient', name=state['name']), 400)
                    + '\n\n<blockquote>' + escaped_excerpt(text, 2600) + '</blockquote>\n\n'
                    + html.escape(tr(lang, 'reply_full_length', count=len(text))))
-        await self.telegram.call('sendMessage', {'chat_id': chat_id, 'text': preview, 'parse_mode': 'HTML',
+        sent = await self.telegram.call('sendMessage', {'chat_id': chat_id, 'text': preview, 'parse_mode': 'HTML',
             'reply_markup': {'inline_keyboard': [[{'text': tr(lang, 'reply_send'), 'callback_data': 'send:' + nonce},
                                                 {'text': tr(lang, 'cancel'), 'callback_data': 'cancel'}]]}})
+        await self.remember_reply_prompt(chat_id, sent, confirmed)
         return True
+
+    async def remember_reply_prompt(self, chat_id, sent, expected):
+        current = await self.get_conversation(chat_id)
+        if sent and sent.get('message_id') and current == expected:
+            # Do not restore a draft cancelled while Telegram was delivering its preview.
+            await self.set_conversation(chat_id, {**current, 'prompt_message_ids': [
+                *current.get('prompt_message_ids', [])[-3:], sent['message_id']]})
 
     def run_feature(self, user, action, values, cancel):
         directory = self.user_path(user['chat_id'], user['storage'])
@@ -213,15 +225,18 @@ class FeatureUI:
                     store.queue_summary(user, start, end)
                 return {'action': action}
             if action == 'prepare_reply':
-                target = store.reply_target(values['token'], now)
+                token = values.get('token')
+                if 'telegram_message_id' in values:
+                    token = store.reply_message_token(values['telegram_message_id'], values.get('fallback_token'), now)
+                target = store.reply_target(token, now)
                 if not target:
-                    raise FeatureError('reply_expired')
+                    raise FeatureError('reply_unavailable' if 'telegram_message_id' in values else 'reply_expired')
                 conversation = site.conversation(target['conversation_id'])
                 if not conversation:
                     raise FeatureError('reply_expired')
                 recipient = self.verified_recipient(conversation, user)
                 return {'action': action, 'conversation_id': str(conversation['id']), **recipient,
-                        'storage': user['storage']}
+                        'storage': user['storage'], **({'draft_text': values['draft_text']} if 'draft_text' in values else {})}
             if action == 'send_reply':
                 conversation = site.conversation(values['conversation_id'])
                 if not conversation:
@@ -278,9 +293,14 @@ class FeatureUI:
                 else:
                     await self.safe_send(chat_id, 'recent_empty')
         elif action == 'prepare_reply':
-            await self.set_conversation(chat_id, {**result, 'step': 'reply_text', 'expires': time.time() + 600})
-            await self.safe_send(chat_id, 'reply_prompt', name=result['name'], keyboard={'inline_keyboard': [[
-                {'text': tr(self.catalog.user(chat_id)['language'], 'cancel'), 'callback_data': 'cancel'}]]})
+            draft = result.pop('draft_text', None)
+            state = {**result, 'step': 'reply_text', 'expires': time.time() + 600}
+            await self.set_conversation(chat_id, state)
+            if draft is not None:
+                await self.confirm_reply(chat_id, state, draft)
+            else:
+                sent = await self.safe_send(chat_id, 'reply_prompt', name=result['name'])
+                await self.remember_reply_prompt(chat_id, sent, state)
         elif action == 'send_reply':
             await self.safe_send(chat_id, 'reply_sent', name=result['name'])
 

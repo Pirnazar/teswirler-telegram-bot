@@ -5,7 +5,7 @@ import asyncio
 import logging
 import time
 
-from aiogram import Bot, Dispatcher, Router
+from aiogram import Bot, Dispatcher, Router, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.middlewares.base import BaseRequestMiddleware
 from aiogram.exceptions import (TelegramAPIError, TelegramBadRequest, TelegramConflictError,
@@ -23,7 +23,7 @@ from aiogram import BaseMiddleware
 from bot import ServiceError
 
 LOG = logging.getLogger('teswirler')
-COMMANDS = ('start', 'connect', 'recent', 'summary', 'settings', 'filters', 'quiet', 'grouping',
+COMMANDS = ('start', 'menu', 'connect', 'recent', 'summary', 'settings', 'filters', 'quiet', 'grouping',
             'digest', 'status', 'pause', 'resume', 'language', 'timezone', 'disconnect', 'cancel', 'help')
 
 
@@ -71,6 +71,16 @@ class Checkpoint(BaseMiddleware):
         self.app.offset = max(self.app.offset, event.update_id + 1)
         self.app.catalog.meta('update_offset', self.app.offset)
         return result
+
+
+class NavigationButton(Filter):
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, message: Message):
+        # A quoted reply containing a button label is still the user's reply text.
+        command = self.app.navigation_command(message.text)
+        return {'navigation': command} if command and not message.reply_to_message else False
 
 
 class AiogramGateway:
@@ -139,8 +149,11 @@ def dispatcher_for(app):
     router.message.filter(PrivateOwner())
     router.callback_query.filter(PrivateOwner())
     router.message.register(app.on_command, Command(commands=list(COMMANDS)))
-    router.message.register(app.on_text, StateFilter(
-        Conversation.login, Conversation.password, Conversation.reply_text, Conversation.reply_confirm))
+    router.message.register(app.on_navigation, NavigationButton(app))
+    # A password sent as a reply to the login prompt must remain a credential.
+    router.message.register(app.on_text, StateFilter(Conversation.login, Conversation.password))
+    router.message.register(app.on_native_reply, F.reply_to_message)
+    router.message.register(app.on_text, StateFilter(Conversation.reply_text, Conversation.reply_confirm))
     router.message.register(app.on_text)
     router.callback_query.register(app.on_callback)
     dispatcher.include_router(router)

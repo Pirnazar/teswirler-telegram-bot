@@ -178,5 +178,27 @@ TEXT['tk'].update({
     'command_grouping': 'Halanmalary birleşdirmek', 'command_summary': 'Şu günüň jemlemesi', 'command_digest': 'Gündelik jemleme',
 })
 
-TEXT['ru']['help'] += '\n\nПоследние — /recent\nНастройки — /settings\nТипы — /filters\nТихие часы — /quiet\nОбъединение — /grouping\nСводка сейчас — /summary\nЕжедневная сводка — /digest\nОтветить можно кнопкой под личным сообщением.'
-TEXT['tk']['help'] += '\n\nSoňky bildirişler — /recent\nSazlamalar — /settings\nGörnüşler — /filters\nÜmsüm sagatlar — /quiet\nBirleşdirmek — /grouping\nHäzir jemleme — /summary\nGündelik jemleme — /digest\nŞahsy hatyň aşagyndaky düwme arkaly jogap berip bilersiňiz.'
+TEXT['ru'].update({
+    'nav_recent': '🕘 Последние', 'nav_summary': '📊 Сводка',
+    'nav_status': '👤 Аккаунт', 'nav_settings': '⚙️ Настройки',
+    'nav_pause': '⏸ Пауза', 'nav_resume': '▶️ Продолжить',
+    'nav_connect': '🔗 Подключить', 'nav_language': '🌐 Язык',
+    'nav_cancel': '✕ Отмена', 'nav_menu': '☰ Меню',
+    'input_hint': 'Выберите действие или ответьте на личное сообщение',
+    'menu_text': 'Меню Teswirler\n\n🕘 Последние — повторить уведомления\n📊 Сводка — события за сегодня\n⚙️ Настройки — типы, тихие часы и время\n\nЧтобы ответить на личное сообщение, смахните его в Telegram для ответа и напишите текст. Бот покажет получателя и попросит подтвердить отправку.',
+    'command_menu': 'Показать кнопки меню',
+    'reply_unavailable': 'Ответ доступен для личных сообщений подключённого аккаунта. Выберите уведомление с кнопкой «↩ Ответить». Если оно устарело, запросите последние уведомления заново. Текст не отправлен.',
+})
+TEXT['tk'].update({
+    'nav_recent': '🕘 Soňkylar', 'nav_summary': '📊 Jemleme',
+    'nav_status': '👤 Hasap', 'nav_settings': '⚙️ Sazlamalar',
+    'nav_pause': '⏸ Duruzmak', 'nav_resume': '▶️ Dowam etmek',
+    'nav_connect': '🔗 Birikdirmek', 'nav_language': '🌐 Dil',
+    'nav_cancel': '✕ Ýatyrmak', 'nav_menu': '☰ Menýu',
+    'input_hint': 'Amaly saýlaň ýa-da şahsy hata jogap ýazyň',
+    'menu_text': 'Teswirler menýusy\n\n🕘 Soňkylar — bildirişleri gaýtalamak\n📊 Jemleme — şu günüň wakalary\n⚙️ Sazlamalar — görnüşler, ümsüm sagatlar we wagt\n\nŞahsy hata jogap bermek üçin Telegram-da habary süýşürip, jogabyňyzy ýazyň. Bot alyjyny görkezer we ibermegi tassyklamagyňyzy sorar.',
+    'command_menu': 'Menýu düwmelerini görkezmek',
+    'reply_unavailable': 'Birikdirilen hasabyň şahsy hatlaryna jogap berip bolýar. «↩ Jogap bermek» düwmesi bolan bildirişi saýlaň. Wagty gutaran bolsa, soňky bildirişleri täzeden soraň. Tekst iberilmedi.',
+})
+TEXT['ru']['help'] += '\n\nМеню с кнопками — /menu\nПоследние — /recent\nНастройки — /settings\nТипы — /filters\nТихие часы — /quiet\nОбъединение — /grouping\nСводка сейчас — /summary\nЕжедневная сводка — /digest\nОтветить на личное сообщение можно кнопкой под ним или функцией Telegram «Ответить». Перед отправкой нужно подтвердить получателя и текст.'
+TEXT['tk']['help'] += '\n\nDüwmeli menýu — /menu\nSoňky bildirişler — /recent\nSazlamalar — /settings\nGörnüşler — /filters\nÜmsüm sagatlar — /quiet\nBirleşdirmek — /grouping\nHäzir jemleme — /summary\nGündelik jemleme — /digest\nŞahsy hata aşagyndaky düwme ýa-da Telegram-yň jogap bermek funksiýasy arkaly jogap berip bolýar. Ibermezden öň alyjyny we teksti tassyklamaly.'

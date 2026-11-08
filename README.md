@@ -15,6 +15,7 @@ Her ulanyjy öz hasabyny birikdirýär. Bot täze hatlary, teswirleri, jogaplary
 - Şahsy hatlara Telegram-dan jogap bermek; alyjy we tekst iberilmezden öň tassyklanýar.
 - Şu günüň jemlemesini soramak ýa-da her gün belli wagtda jemleme almak.
 - Dili we wagt zolagyny üýtgetmek.
+- Habar ýazylýan meýdanyň aşagyndaky hemişelik düwmelerden peýdalanmak.
 - Hasaby aýyrmak we onuň işjeň sessiýasyny, taryhyny hem nobatyny öçürmek.
 
 Bildirişde wakanyň görnüşi we ulanyjynyň ady aýratyn görkezilýär. Hat ýa-da teswir sitata görnüşinde berilýär; doly teksti saýtda açmak üçin düwme bar. Wagt saýlanan UTC zolagyna görä görkezilýär. Awtorlaryň ýazgylary terjime edilmeýär.
@@ -34,6 +35,7 @@ Giriş ädimleriniň her biri üçin bäş minut berilýär. Bot täzeden işe b
 | Buýruk | Näme edýär? |
 | --- | --- |
 | `/start` | Boty açýar we dil saýladýar |
+| `/menu` | Hemişelik menýu düwmelerini görkezýär |
 | `/connect` | Saýtdaky hasaby birikdirýär |
 | `/status` | Hasabyň ýagdaýyny görkezýär |
 | `/recent` | Soňky 5 ýa-da 10 bildirişi saýladýar |
@@ -55,7 +57,7 @@ Giriş ädimleriniň her biri üçin bäş minut berilýär. Bot täzeden işe b
 | `/cancel` | Girişi ýa-da jogap ýazmagy ýatyrýar |
 | `/help` | Kömek görkezýär |
 
-Bu amallaryň köpüsi menýudaky düwmeler bilen hem elýeterli.
+Esasy menýu habar ýazylýan meýdanyň aşagynda görkezilýär: **Soňkylar**, **Jemleme**, **Hasap**, **Sazlamalar**, **Duruzmak / Dowam etmek** we **Dil**. Hasap birikdirilmedik bolsa, birikdirmek düwmesi görkezilýär. Giriş ýa-da jogap ýazylýarka **Ýatyrmak** we **Menýu** düwmeleri bolýar. Düwmeler gizlenen bolsa, `/menu` iberiň. Hasaby aýyrmak **Sazlamalar** bölüminde hem elýeterli.
 
 ### Deslapky sazlamalar
 
@@ -70,7 +72,11 @@ Bu amallaryň köpüsi menýudaky düwmeler bilen hem elýeterli.
 
 ### Hatlara jogap bermek
 
-Şahsy hatyň aşagyndaky **Jogap bermek** düwmesine basyň. Bot saýtyň API-si arkaly söhbeti we alyjyny barlar, soňra jogabyňyzy ýazmagy sorar. Teksti we alyjyny barlap, **Ibermek** düwmesine basyň.
+Telegram-da gelen şahsy hat bildirişini süýşürip ýa-da onuň menýusyndan **Jogap bermek / Ответить** saýlap, tekstiňizi iberiň. Bot şol bildirişe degişli söhbeti we alyjyny saýtyň API-si arkaly barlar. Teksti we alyjyny barlap, **Ibermek** düwmesine basyň. Tassyklamazdan saýta hiç zat iberilmeýär.
+
+Şahsy hatyň aşagyndaky **↩ Jogap bermek** düwmesi hem işleýär: ilki alyjy barlanýar, soňra bot jogabyňyzy ýazmagy soraýar. Häzir diňe tekst jogaplary goldanylýar (4000 nyşana çenli).
+
+Täze iberilen bildirişleriň Telegram habar belgisi degişli hasabyň bazasynda saklanýar; bu baglanyşyk bot täzeden işe başlanda hem ýitmeýär we ýedi gün işleýär. Öňki bildirişleriň öz jogap düwmesi heniz güýjünde bolsa, olar hem ulanylyp bilner. Başga hasabyň, ugradylan ýa-da näbelli habaryň tekstinden alyjy kesgitlenmeýär. Köne bildiriş işlemese, **Soňkylar** arkaly täzesini soraň.
 
 Täze tekst öňki garalamany çalyşýar; öňki tassyklama indi işlemeýär. Ibermezden öň alyjylar ýene barlanýar. Tor näsazlygy sebäpli netijesi näbelli bolsa, bot habary awtomatiki gaýtadan ibermeýär: ilki saýtdaky söhbeti barlamagy soraýar.
 
