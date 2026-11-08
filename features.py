@@ -103,22 +103,85 @@ class FeatureStore(Store):
             CREATE TABLE IF NOT EXISTS reply_sends (
                 nonce TEXT PRIMARY KEY, status TEXT NOT NULL, created REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS notification_revisions (
+                notification_id TEXT NOT NULL, revision TEXT NOT NULL,
+                PRIMARY KEY(notification_id,revision)
+            );
+            CREATE TABLE IF NOT EXISTS like_state (
+                notification_id TEXT PRIMARY KEY, max_count INTEGER NOT NULL,
+                last_count INTEGER NOT NULL, actors TEXT NOT NULL
+            );
         ''')
+        if 'is_event' not in {row[1] for row in self.db.execute('PRAGMA table_info(activity)')}:
+            self.db.execute('ALTER TABLE activity ADD COLUMN is_event INTEGER NOT NULL DEFAULT 1')
         self.db.commit()
+        self._migrate_event_detection()
+
+    def _track_like(self, notification):
+        """A shrinking/returning aggregate is not evidence of a new like."""
+        key = str(notification['id'])
+        people = {str(person['id']) for person in actors(notification) if person.get('id') is not None}
+        raw_count = notification.get('actorCount')
+        count = max(0, int(raw_count)) if raw_count is not None else max(1, len(people))
+        old = self.db.execute('SELECT max_count,last_count,actors FROM like_state WHERE notification_id=?', (key,)).fetchone()
+        if old:
+            maximum, last_count, encoded = old
+            known = set(json.loads(encoded))
+            new_people = bool(known and people - known)
+            positive = count > maximum or (count >= last_count and new_people)
+            maximum, people = max(maximum, count), known | people
+        else:
+            maximum, positive = count, count > 0
+        self.db.execute('INSERT OR REPLACE INTO like_state VALUES (?,?,?,?)',
+                        (key, maximum, count, json.dumps(sorted(people))))
+        return positive
+
+    def _migrate_event_detection(self):
+        if self.db.execute("SELECT 1 FROM meta WHERE key='event_detection_v1'").fetchone():
+            return
+        with self.db:
+            # Preserve all known versions, including already-sent states that later reappear.
+            self.db.execute('INSERT OR IGNORE INTO notification_revisions SELECT notification_id,revision FROM activity')
+            self.db.execute('INSERT OR IGNORE INTO notification_revisions SELECT id,revision FROM history')
+            self.db.execute('INSERT OR IGNORE INTO notification_revisions SELECT id,fingerprint FROM seen')
+            for row_id, source in self.db.execute("SELECT id,source FROM activity WHERE category='likes' ORDER BY at,id").fetchall():
+                positive = self._track_like(json.loads(source))
+                self.db.execute('UPDATE activity SET is_event=? WHERE id=?', (int(positive), row_id))
+            for (source,) in self.db.execute('SELECT source FROM history').fetchall():
+                notification = json.loads(source)
+                if category(notification) == 'likes':
+                    self._track_like(notification)
+            # Old false alarms may still be pending; explicit /recent requests are retained.
+            for seq, source in self.db.execute("SELECT seq,source FROM outbox WHERE kind='auto' AND category='likes' AND source IS NOT NULL").fetchall():
+                members = json.loads(source).values()
+                flags = [self.db.execute('SELECT is_event FROM activity WHERE notification_id=? AND revision=?',
+                         (str(n['id']), fingerprint(n))).fetchone() for n in members]
+                if flags and all(flag is not None and not flag[0] for flag in flags):
+                    self.db.execute('DELETE FROM outbox WHERE seq=?', (seq,))
+            self.db.execute("INSERT INTO meta VALUES ('event_detection_v1','1')")
 
     def archive(self, notifications, now):
+        events = {}
         for n in notifications:
             key, revision = str(n['id']), fingerprint(n)
             old = self.db.execute('SELECT revision FROM history WHERE id=?', (key,)).fetchone()
             source = json.dumps(n, ensure_ascii=False)
             when = source_timestamp(n, now) if not old else now
+            events[key] = False
             if not old or old[0] != revision:
-                self.db.execute('INSERT OR IGNORE INTO activity(notification_id,revision,at,category,source) VALUES (?,?,?,?,?)',
-                                (key, revision, when, category(n), source))
+                known = bool(self.db.execute('SELECT 1 FROM notification_revisions WHERE notification_id=? AND revision=?',
+                                            (key, revision)).fetchone())
+                positive = self._track_like(n) if category(n) == 'likes' else True
+                events[key] = positive and not known
+                countable = positive and (not known or old is None)
+                self.db.execute('INSERT OR IGNORE INTO activity(notification_id,revision,at,category,source,is_event) VALUES (?,?,?,?,?,?)',
+                                (key, revision, when, category(n), source, int(countable)))
                 self.db.execute('INSERT OR REPLACE INTO history VALUES (?,?,?,?)', (key, revision, source, now))
+                self.db.execute('INSERT OR IGNORE INTO notification_revisions VALUES (?,?)', (key, revision))
         self.db.execute('DELETE FROM activity WHERE at<?', (now - 90 * 86400,))
         self.db.execute('DELETE FROM reply_targets WHERE expires<?', (now,))
         self.db.execute('DELETE FROM reply_sends WHERE created<?', (now - 30 * 86400,))
+        return events
 
     def card(self, notification, user, now):
         message = notification_message(notification, user.get('language', 'ru'), user.get('timezone_minutes', 0))
@@ -147,14 +210,14 @@ class FeatureStore(Store):
         initialized = bool(self.db.execute("SELECT 1 FROM meta WHERE key='initialized'").fetchone())
         queued = 0
         with self.db:
-            self.archive(notifications, now)
+            events = self.archive(notifications, now)
             for n in sorted(notifications, key=lambda row: (row.get('createdAt') or '', str(row['id']))):
                 key, revision = str(n['id']), fingerprint(n)
                 old = self.db.execute('SELECT fingerprint FROM seen WHERE id=?', (key,)).fetchone()
                 if old and old[0] == revision:
                     continue
                 self.db.execute('INSERT OR REPLACE INTO seen VALUES (?,?)', (key, revision))
-                if not initialized or category(n) in muted_categories(user):
+                if not initialized or not events[key] or category(n) in muted_categories(user):
                     continue
                 group_key = self.like_key(n) if user.get('grouping', 1) else None
                 previous = self.db.execute("SELECT seq,source FROM outbox WHERE kind='auto' AND group_key=? ORDER BY seq LIMIT 1",
@@ -209,7 +272,7 @@ class FeatureStore(Store):
         language = user.get('language', 'ru')
         local = local_time(user, end)
         date = f'{local.day} {MONTHS[language][local.month - 1]}'
-        rows = self.db.execute('SELECT category,COUNT(*) FROM activity WHERE at>=? AND at<? GROUP BY category', (start, end)).fetchall()
+        rows = self.db.execute('SELECT category,COUNT(*) FROM activity WHERE is_event=1 AND at>=? AND at<? GROUP BY category', (start, end)).fetchall()
         muted = muted_categories(user) if respect_filters else set()
         counts = {key: count for key, count in rows if key not in muted}
         lines = [f'📊 <b>{html.escape(tr(language,"summary_title", date=date))}</b>', '']
@@ -221,7 +284,7 @@ class FeatureStore(Store):
             lines.extend(('', '<b>' + html.escape(tr(language, 'summary_total', count=total)) + '</b>'))
         else:
             lines.append(html.escape(tr(language, 'summary_empty')))
-        links = self.db.execute('SELECT source FROM activity WHERE at>=? AND at<? ORDER BY at DESC LIMIT 30', (start, end)).fetchall()
+        links = self.db.execute('SELECT source FROM activity WHERE is_event=1 AND at>=? AND at<? ORDER BY at DESC LIMIT 30', (start, end)).fetchall()
         if links:
             lines.extend(('', html.escape(tr(language, 'summary_links'))))
             used = set()

@@ -8,7 +8,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from bot import ServiceError, Teswirler
+from bot import ServiceError, Store, Teswirler, fingerprint
 from features import FeatureStore, quiet_until, digest_due, today_range
 from features_ui import FeatureError
 from public_bot import PublicBot
@@ -105,6 +105,107 @@ class FeatureStoreTests(unittest.TestCase):
         rich=json.loads(self.rows()[0][2])
         self.assertEqual(len(self.rows()), 1)
         self.assertIn('и ещё 3', rich['text'])
+
+    def test_decreasing_like_count_does_not_resend_or_inflate_summary(self):
+        original=self.event(type='LIKE',actorCount=14)
+        self.store.observe([original],now=self.now)
+        for index,count in enumerate((13,12,7,6,5,4)):
+            self.store.observe([{**original,'actorCount':count}],now=self.now+30*(index+1))
+        self.assertFalse(self.rows())
+        self.assertEqual(self.store.db.execute("SELECT SUM(is_event) FROM activity WHERE category='likes'").fetchone()[0],1)
+        summary=self.store.summary(preferences(),self.now-3600,self.now+1000)
+        self.assertIn('Всего событий: 1',summary['text'])
+
+    def test_count_recovery_and_known_snapshots_do_not_resend_after_restart(self):
+        original=self.event(type='LIKE',actorCount=14)
+        self.store.observe([original],now=self.now)
+        self.store.observe([{**original,'actorCount':13}],now=self.now+30)
+        self.store.db.close()
+        self.store=FeatureStore(self.path,'one')
+        for index,count in enumerate((14,13,12,14,13)):
+            self.store.observe([{**original,'actorCount':count}],now=self.now+60+index*30)
+        self.assertFalse(self.rows())
+        self.store.observe([{**original,'actorCount':15}],now=self.now+300)
+        self.assertEqual(len(self.rows()),1)
+
+    def test_new_actor_is_delivered_even_below_previous_count_peak(self):
+        original=self.event(type='LIKE',actorCount=14)
+        self.store.observe([original],now=self.now)
+        self.store.observe([{**original,'actorCount':12}],now=self.now+30)
+        actual_new={**original,'actorCount':13,'actors':[{'id':'new-person','name':'New person'}]}
+        self.store.observe([actual_new],now=self.now+60)
+        self.assertEqual(len(self.rows()),1)
+        self.store.observe([original],now=self.now+90)
+        self.store.observe([actual_new],now=self.now+120)
+        self.assertEqual(len(self.rows()),1)
+
+    def test_partial_actor_rotation_during_count_drop_is_not_a_new_like(self):
+        original=self.event(type='LIKE',actorCount=14)
+        self.store.observe([original],now=self.now)
+        decreased={**original,'actorCount':13,'actors':[{'id':'previously-hidden','name':'Person'}]}
+        self.store.observe([decreased],now=self.now+30)
+        self.assertFalse(self.rows())
+
+    def test_like_title_edit_does_not_create_new_activity(self):
+        original=self.event(type='LIKE',actorCount=14)
+        self.store.observe([original],now=self.now)
+        self.store.observe([{**original,'preview':'Edited article title'}],now=self.now+30)
+        self.assertFalse(self.rows())
+
+    def test_replayed_message_snapshot_is_not_sent_but_new_message_is(self):
+        self.store.observe([],now=self.now)
+        first=self.event(type='MESSAGE',conversationId='room',preview='First message')
+        second={**first,'preview':'Second message','createdAt':'2026-11-09T11:31:00Z'}
+        for index,row in enumerate((first,second,first,second)):
+            self.store.observe([row],now=self.now+index*30)
+        self.assertEqual(len(self.rows()),2)
+        repeated_text_new_event={**second,'createdAt':'2026-11-09T11:32:00Z'}
+        self.store.observe([repeated_text_new_event],now=self.now+150)
+        self.assertEqual(len(self.rows()),3)
+
+    def test_explicit_recent_can_still_repeat_a_known_like(self):
+        original=self.event(type='LIKE',actorCount=14)
+        self.store.observe([original],now=self.now)
+        self.store.queue_recent([original],preferences(),self.now+30)
+        self.assertEqual(len(self.rows()),1)
+        self.assertEqual(self.rows()[0][3],'manual')
+
+    def test_upgrade_reclassifies_old_counter_drops_and_preserves_manual_queue(self):
+        path=Path(self.temp.name)/'legacy.sqlite3'
+        legacy=Store(path,'one')
+        original=self.event(type='LIKE',actorCount=14)
+        decreased={**original,'actorCount':13}
+        latest={**original,'actorCount':12}
+        legacy.observe([original])
+        legacy.observe([decreased])  # old version wrongly queued this as a new notification
+        legacy.db.executescript('''
+            CREATE TABLE history(id TEXT PRIMARY KEY,revision TEXT NOT NULL,source TEXT NOT NULL,updated REAL NOT NULL);
+            CREATE TABLE activity(id INTEGER PRIMARY KEY,notification_id TEXT NOT NULL,revision TEXT NOT NULL,
+                at REAL NOT NULL,category TEXT NOT NULL,source TEXT NOT NULL,UNIQUE(notification_id,revision));
+            ALTER TABLE outbox ADD COLUMN kind TEXT NOT NULL DEFAULT 'auto';
+            ALTER TABLE outbox ADD COLUMN category TEXT;
+            ALTER TABLE outbox ADD COLUMN source TEXT;
+        ''')
+        with legacy.db:
+            for index,row in enumerate((original,decreased,latest)):
+                legacy.db.execute('INSERT INTO activity(notification_id,revision,at,category,source) VALUES (?,?,?,?,?)',
+                    (row['id'],fingerprint(row),self.now+index*30,'likes',json.dumps(row)))
+            legacy.db.execute('INSERT INTO history VALUES (?,?,?,?)',
+                (latest['id'],fingerprint(latest),json.dumps(latest),self.now+60))
+            legacy.db.execute('UPDATE outbox SET category=?,source=?',('likes',json.dumps({decreased['id']:decreased})))
+            legacy.db.execute("INSERT INTO outbox(text,kind,category,source) VALUES ('Manual replay','manual','likes',?)",
+                              (json.dumps({decreased['id']:decreased}),))
+        legacy.db.close()
+        upgraded=FeatureStore(path,'one')
+        try:
+            self.assertEqual(upgraded.db.execute('SELECT SUM(is_event) FROM activity').fetchone()[0],1)
+            self.assertEqual(upgraded.db.execute('SELECT kind FROM outbox').fetchall(),[('manual',)])
+            upgraded.observe([original],now=self.now+90)
+            self.assertEqual(upgraded.db.execute('SELECT COUNT(*) FROM outbox').fetchone()[0],1)
+            state=upgraded.db.execute('SELECT max_count FROM like_state').fetchone()[0]
+            self.assertEqual(state,14)
+        finally:
+            upgraded.db.close()
 
     def test_summary_unique_activity_and_filters(self):
         rows=[self.event('one', type='MESSAGE'), self.event('two', type='LIKE'), self.event('three', type='ANSWER')]

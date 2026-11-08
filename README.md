@@ -62,6 +62,7 @@ Bu amallaryň köpüsi menýudaky düwmeler bilen hem elýeterli.
 - Bildirişleriň ähli görnüşleri açyk.
 - Ümsüm sagatlar öçürilen.
 - Halanmalary birleşdirmek açyk; garaşylýan wagt 20 sekunt.
+- Saýtdaky halanma sanynyň azalmagy ýa-da öň görlen ýagdaýyň gaýtadan gelmegi täze bildiriş döretmeýär. Bot öňki iň ýokary sany we görülen gatnaşyjylary ýatda saklaýar; täze san ösüşi ýa-da täze gatnaşyjy aýratyn barlanýar.
 - Gündelik jemleme ýerli wagt bilen **21:00-da** açyk.
 - Täze ulanyjynyň wagt zolagy **UTC+5**. `/timezone` arkaly üýtgedip bolýar.
 
