@@ -17,7 +17,7 @@ def notification(identifier='one', **extra):
             'commentId': 'comment', **extra}
 
 
-class StoreTests(unittest.TestCase):
+class StoreTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.path = Path(self.directory.name) / 'state.sqlite3'
@@ -55,24 +55,23 @@ class StoreTests(unittest.TestCase):
         updated = {**old, 'actorCount': 2, 'preview': 'Другой ответ'}
         self.assertEqual(self.store.observe([updated]), (True, 1))
 
-    def test_outbox_survives_restart_and_failed_delivery(self):
+    async def test_outbox_survives_restart_and_failed_delivery(self):
         self.store.observe([])
         self.store.observe([notification()])
         class Offline:
-            def call(self, *args):
+            async def call(self, *args):
                 raise ServiceError('Telegram', 429, 5)
         with self.assertRaises(ServiceError):
-            self.store.flush(Offline(), 123)
+            await self.store.flush(Offline(), 123)
         self.store.db.close()
         self.store = Store(self.path, 'owner')
         self.assertEqual(self.queued(), 1)
         calls = []
         class Online:
-            def call(self, *args):
+            async def call(self, *args):
                 calls.append(args)
-        with patch('bot.time.sleep'):
-            self.assertEqual(self.store.flush(Online(), 123), 1)
-            self.assertEqual(self.store.flush(Online(), 123), 0)
+        self.assertEqual(await self.store.flush(Online(), 123), 1)
+        self.assertEqual(await self.store.flush(Online(), 123), 0)
         self.assertEqual(len(calls), 1)
 
     def test_account_cannot_receive_another_accounts_outbox(self):

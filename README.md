@@ -2,7 +2,7 @@
 
 [teswirler.com](https://teswirler.com) saýtynyň bildirişlerini Telegram-da almak üçin köp ulanyjyly bot.
 
-**Bot:** [@teswirlerBot](https://t.me/teswirlerBot) · **Interfeýs:** Türkmençe we Русский · **Python:** 3.10+
+**Bot:** [@teswirlerBot](https://t.me/teswirlerBot) · **Interfeýs:** Türkmençe we Русский · **Python:** 3.10–3.14 · **Framework:** aiogram 3.31.0
 
 Her ulanyjy öz hasabyny birikdirýär. Bot täze hatlary, teswirleri, jogaplary, bellenmeleri we beýleki bildirişleri şahsy söhbete iberýär.
 
@@ -94,7 +94,7 @@ Her ulanyjynyň sessiýasy, taryhy we iberiş nobaty aýratyn katalogda ýerleş
 
 Gerek zatlar:
 
-- Python 3.10 ýa-da has täze wersiýa;
+- Python 3.10–3.14;
 - Telegram-daky [@BotFather](https://t.me/BotFather) arkaly döredilen botuň tokeni;
 - Telegram we teswirler.com bilen internet aragatnaşygy.
 
@@ -107,9 +107,9 @@ Systemd hyzmaty `~/teswirler-bot` katalogyna niýetlenen:
 ```bash
 git clone https://github.com/Pirnazar/teswirler-telegram-bot.git ~/teswirler-bot
 cd ~/teswirler-bot
-python3 -m venv .venv-public
-.venv-public/bin/python -m pip install -r requirements.txt
-.venv-public/bin/python bot.py pair
+python3 -m venv .venv-aiogram
+.venv-aiogram/bin/python -m pip install -r requirements.txt
+.venv-aiogram/bin/python bot.py pair
 ```
 
 `pair` bot tokenini gizlin giriş bilen soraýar. Görkezilen Telegram salgysyny açyp, şol gezeklik `/start` koduny iberiň. Bu ädim administratoryň Telegram söhbetini bellige alýar; saýtdaky hasaby birikdirmek botuň interfeýsinde aýratyn ýerine ýetirilýär.
@@ -117,7 +117,7 @@ python3 -m venv .venv-public
 Soňra:
 
 ```bash
-.venv-public/bin/python public_bot.py
+.venv-aiogram/bin/python public_bot.py
 ```
 
 Boty açyp, `/start` arkaly saýtdaky hasabyňyzy birikdiriň.
@@ -189,8 +189,9 @@ powershell -ExecutionPolicy Bypass -File .\Install-Autostart.ps1 -Remove
 ## Taslamanyň gurluşy
 
 ```text
-bot.py                     Saýtyň we Telegram-yň API müşderileri, bildiriş görnüşi
-public_bot.py              Köp ulanyjyly bot, giriş we işleriň dolandyrylyşy
+bot.py                     Saýtyň API müşderisi, bildiriş görnüşi we başlangyç sazlama
+public_bot.py              Async bot, FSM giriş we fon işleriniň dolandyrylyşy
+telegram_runtime.py        aiogram 3 Router, Dispatcher, Bot we transport
 features.py                Süzgüçler, birleşdirmek, taryh we jemlemeler
 features_ui.py             Sazlama menýulary we jogap tassyklamasy
 i18n.py                    Türkmençe we rusça interfeýs tekstleri
@@ -218,3 +219,21 @@ Testler wagtlaýyn kataloglary we hyzmatlaryň çalşyrylan nusgalaryny ulanýar
 - Ulanyjylar köpelse, saýtyň özünde waka nobatyny we parol ibermezden birikdirmegi goşmak ýerlikli bolar.
 
 Peýdaly çeşmeler: [Telegram Bot API](https://core.telegram.org/bots/api) · [Fernet](https://cryptography.io/en/latest/fernet/)
+
+## aiogram 3 gurluşy
+
+Telegram bilen aragatnaşyk `aiogram 3` arkaly asynkron ýerine ýetirilýär. `Router`
+buýruklary we düwmeleri kabul edýär, `Dispatcher` bolsa long polling-i dolandyrýar.
+Giriş we jogap garalamalary `FSMContext` bilen diňe `MemoryStorage` içinde saklanýar;
+parollar we garalamalar daşarky FSM bazasyna ýazylmaýar.
+
+Bildiriş nobaty, hasap sazlamalary, şifrlenen sessiýalar we gaýtalanmalary saklaýan
+bellikler öňki faýllarda galýar. Köne `update_offset` täze poller-e geçirilýär.
+Täzelenme tamamlanmanka ýa-da parolly habar işlenilmänkä onuň pozisiýasy öňe
+süýşürilmeýär. Saýtyň haýyşlary aýratyn işçi akymlarda ýerine ýetirilýär we Telegram
+buýruklarynyň işini saklamaýar.
+
+Täzelenmeden öň hyzmaty duruzyň, maglumatlary ätiýaçlandyryň we täze talaplary
+aýratyn `.venv-aiogram` gurşawyna guruň. Soňra täzelenen systemd faýlyny göçürip,
+`daemon-reload` we `restart` ýerine ýetiriň. Bir token bilen iki poller-i bile
+işletmäň.

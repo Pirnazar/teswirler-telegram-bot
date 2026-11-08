@@ -1,7 +1,8 @@
-"""Personal Teswirler notifications bridge. Python 3.10+, standard library only."""
+"""Teswirler API helpers, notification formatting and administrator setup CLI."""
 from __future__ import annotations
 
 import argparse
+import asyncio
 import contextlib
 from datetime import datetime, timedelta, timezone
 import getpass
@@ -13,7 +14,6 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 import re
-import secrets
 import sqlite3
 import time
 import urllib.error
@@ -63,7 +63,7 @@ def request_json(opener, url, *, body=None, headers=None, timeout=35, service='A
             pass
         raise ServiceError(service, error.code, delay) from None
     except (OSError, ValueError):
-        # Do not log request URLs: Telegram URLs contain the secret token.
+        # Do not log request URLs or response bodies containing credentials.
         raise ServiceError(service) from None
 
 
@@ -386,66 +386,21 @@ class Store:
             self.db.execute("INSERT OR REPLACE INTO meta VALUES ('initialized', '1')")
         return initialized, queued
 
-    def flush(self, telegram, chat_id):
+    async def flush(self, telegram, chat_id):
         count = 0
         for seq, text, payload in self.db.execute('SELECT seq,text,payload FROM outbox ORDER BY seq').fetchall():
-            telegram.call('sendMessage', {'chat_id': chat_id, **queued_message(text, payload)})
+            await telegram.call('sendMessage', {'chat_id': chat_id, **queued_message(text, payload)})
             with self.db:
                 self.db.execute('DELETE FROM outbox WHERE seq=?', (seq,))
             count += 1
-            time.sleep(1.1)
         return count
 
 
-class Telegram:
-    def __init__(self, token):
-        if not re.fullmatch(r'\d+:[A-Za-z0-9_-]+', token):
-            raise RuntimeError('Invalid Telegram token format')
-        self.token = token
-        self.opener = urllib.request.build_opener()
-
-    def call(self, method, body=None):
-        result = request_json(self.opener, f'https://api.telegram.org/bot{self.token}/{method}',
-                              body=body or {}, service='Telegram')
-        if not result.get('ok'):
-            raise ServiceError('Telegram', result.get('error_code', 0))
-        return result['result']
-
-
 def telegram_setup():
-    token_path = ROOT / 'telegram-token.txt'
-    config = read_json(PRIVATE / 'telegram.json')
-    token = token_path.read_text(encoding='utf-8-sig').strip() if token_path.exists() else config.get('token')
-    if not token:
-        token = getpass.getpass('Telegram bot token: ').strip()
-    telegram = Telegram(token)
-    bot = telegram.call('getMe')
-    webhook = telegram.call('getWebhookInfo')
-    if webhook.get('url'):
-        raise RuntimeError('This bot has an active webhook. Use a separate bot; webhook was preserved.')
-    code = secrets.token_hex(4)
-    print(f"Open https://t.me/{bot['username']}?start={code}", flush=True)
-    print(f'Or send this exact command privately to the bot: /start {code}', flush=True)
-    print('Waiting up to 10 minutes for your pairing code...', flush=True)
-    offset = 0
-    deadline = time.monotonic() + 600
-    while time.monotonic() < deadline:
-        updates = telegram.call('getUpdates', {'offset': offset, 'timeout': 20, 'allowed_updates': ['message']})
-        for update in updates:
-            offset = update['update_id'] + 1
-            message = update.get('message', {})
-            chat = message.get('chat', {})
-            if chat.get('type') == 'private' and message.get('text', '').strip() == f'/start {code}':
-                config = {'token': token, 'chat_id': chat['id'], 'bot_id': bot['id'], 'username': bot['username']}
-                write_json(PRIVATE / 'telegram.json', config)
-                telegram.call('sendMessage', {'chat_id': chat['id'], 'text':
-                    'Подключено. Новые уведомления Teswirler будут приходить в этот чат.'})
-                telegram.call('getUpdates', {'offset': offset, 'timeout': 0})
-                if token_path.exists():
-                    token_path.unlink()
-                print('Telegram chat paired. Token saved in .secrets/telegram.json.', flush=True)
-                return
-    raise RuntimeError('Pairing timed out. Run python bot.py pair again.')
+    import asyncio
+    from telegram_runtime import pair_bot
+    with single_instance():
+        asyncio.run(pair_bot(ROOT))
 
 
 @contextlib.contextmanager
@@ -473,36 +428,47 @@ def single_instance():
         handle.close()
 
 
-def run(once=False, interval=30):
+async def run(once=False, interval=30):
+    with single_instance():
+        await _run_personal(once, interval)
+
+
+async def _run_personal(once=False, interval=30):
+    """Compatibility CLI for the original personal account, using aiogram transport."""
+    from telegram_runtime import AiogramGateway
     site = Teswirler()
-    user = site.get('/auth/me')
+    user = await asyncio.to_thread(site.get, '/auth/me')
     config = read_json(PRIVATE / 'telegram.json')
     if not config.get('chat_id'):
         raise RuntimeError('First run: python bot.py pair')
-    telegram = Telegram(config['token'])
-    if telegram.call('getMe')['id'] != config['bot_id']:
-        raise RuntimeError('Bot identity changed. Pair again.')
-    store = Store(ROOT / 'data' / 'notifications.sqlite3', user['id'])
-    with single_instance():
-        LOG.info('Monitoring started; interval=%ss', interval)
+    telegram = AiogramGateway(config['token'])
+    store = None
+    try:
+        if (await telegram.call('getMe'))['id'] != config['bot_id']:
+            raise RuntimeError('Bot identity changed. Pair again.')
+        store = Store(ROOT / 'data' / 'notifications.sqlite3', user['id'])
         failures = 0
         while True:
             try:
-                store.flush(telegram, config['chat_id'])
-                initialized, queued = store.observe(site.notifications())
-                sent = store.flush(telegram, config['chat_id'])
+                await store.flush(telegram, config['chat_id'])
+                initialized, queued = store.observe(await asyncio.to_thread(site.notifications))
+                sent = await store.flush(telegram, config['chat_id'])
                 LOG.info('Check complete: queued=%s sent=%s baseline=%s', queued, sent, not initialized)
                 failures = 0
                 if once:
                     return
-                time.sleep(interval)
+                await asyncio.sleep(interval)
             except (ServiceError, RuntimeError) as error:
-                LOG.error('%s', error)
+                LOG.error('%s', type(error).__name__)
                 if once:
                     raise
                 failures += 1
-                time.sleep(max(min(300, interval * 2 ** min(failures, 4)),
-                               min(3600, getattr(error, 'retry_after', 0))))
+                await asyncio.sleep(max(min(300, interval * 2 ** min(failures, 4)),
+                                        min(3600, getattr(error, 'retry_after', 0))))
+    finally:
+        if store:
+            store.db.close()
+        await telegram.close()
 
 
 def main():
@@ -531,7 +497,7 @@ def main():
                     Store(ROOT / 'data' / 'notifications.sqlite3', user['id']).observe(notifications)
             print(f'Site connection OK. Notifications available: {len(notifications)}.')
         else:
-            run(args.command == 'once', args.interval)
+            asyncio.run(run(args.command == 'once', args.interval))
     except (ServiceError, RuntimeError, ValueError, OSError, KeyError) as error:
         LOG.error('%s', error if isinstance(error, (ServiceError, RuntimeError)) else type(error).__name__)
         return 1

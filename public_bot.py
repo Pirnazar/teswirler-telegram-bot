@@ -1,6 +1,7 @@
 """Multi-user Russian/Turkmen bot. Passwords exist only in memory during login."""
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from dataclasses import dataclass
@@ -20,8 +21,13 @@ import urllib.request
 import uuid
 
 from cryptography.fernet import Fernet, InvalidToken
+from aiogram.filters import CommandObject
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.base import StorageKey
+from aiogram.types import Message, CallbackQuery, Update
+from telegram_runtime import AiogramGateway, Conversation, InitialOffset, dispatcher_for
 
-from bot import (ROOT, PRIVATE, LOG, ServiceError, Store, Telegram, Teswirler,
+from bot import (ROOT, PRIVATE, LOG, ServiceError, Teswirler,
                  read_json, single_instance, queued_message, timezone_label)
 from i18n import tr
 from features import FeatureStore
@@ -157,35 +163,6 @@ class Catalog:
             "SELECT * FROM users WHERE (enabled=1 OR pending_manual=1) AND status='active' AND next_run<=? ORDER BY next_run LIMIT 100", (now,))]
 
 
-class PacedTelegram(Telegram):
-    def __init__(self, token):
-        super().__init__(token)
-        self.send_lock = threading.Lock()
-        self.last_send = 0
-        self.chat_sent = {}
-        self.blocked_until = 0
-
-    def call(self, method, body=None):
-        if method != 'sendMessage':
-            return super().call(method, body)
-        with self.send_lock:
-            now = time.monotonic()
-            chat = body['chat_id']
-            delay = max(self.last_send + .05, self.chat_sent.get(chat, 0) + 1.1, self.blocked_until) - now
-            if delay > 0:
-                # Keep pacing bounded; a Telegram retry_after is handled by the caller.
-                if delay > 2:
-                    raise ServiceError('Telegram', 429, int(delay) + 1)
-                time.sleep(delay)
-            self.last_send = self.chat_sent[chat] = time.monotonic()
-            try:
-                return super().call(method, body)
-            except ServiceError as error:
-                if error.status == 429:
-                    self.blocked_until = time.monotonic() + max(1, error.retry_after)
-                raise
-
-
 @dataclass
 class Job:
     future: object
@@ -211,14 +188,18 @@ class PublicBot(FeatureUI):
             owner = read_json(self.private / 'telegram.json').get('chat_id')
             if owner:
                 self.catalog.update(owner, timezone_minutes=480)
-        self.telegram = telegram or PacedTelegram(read_json(self.private / 'telegram.json')['token'])
+        self.telegram = telegram or AiogramGateway(read_json(self.private / 'telegram.json')['token'])
+        self.bot = self.telegram.bot
         self.site_factory = site_factory
         self.executor = ThreadPoolExecutor(max_workers=WORKERS, thread_name_prefix='teswirler')
-        self.states = {}
+        self.active_conversations = set()
         self.jobs = {}
         self.pending_actions = {}
         self.removing = set()
-        self.offset = int(self.catalog.meta('update_offset') or 0)
+        self.offset = int(self.catalog.meta('update_offset') or read_json(self.private / 'telegram.json').get('update_offset', 0))
+        self.dispatcher = dispatcher_for(self)
+        self.bot.session.middleware(InitialOffset(self.offset))
+        self.closed = False
 
     def user_path(self, chat_id, storage):
         # Both identifiers are generated/verified by us; never accept a path from Telegram.
@@ -236,22 +217,22 @@ class PublicBot(FeatureUI):
                                     [button('language'), button('timezone')],
                                     [button('disconnect')]]}
 
-    def send(self, chat_id, key, *, keyboard=None, **values):
+    async def send(self, chat_id, key, *, keyboard=None, **values):
         user = self.catalog.user(chat_id)
-        return self.telegram.call('sendMessage', {
+        return await self.telegram.call('sendMessage', {
             'chat_id': chat_id, 'text': tr(user['language'], key, **values),
             'reply_markup': keyboard if keyboard is not None else self.menu(user),
             'link_preview_options': {'is_disabled': True},
         })
 
-    def languages(self, chat_id):
-        self.send(chat_id, 'choose', keyboard={'inline_keyboard': [[
+    async def languages(self, chat_id):
+        await self.send(chat_id, 'choose', keyboard={'inline_keyboard': [[
             {'text': 'Русский', 'callback_data': 'lang_ru'},
             {'text': 'Türkmençe', 'callback_data': 'lang_tk'},
         ]]})
 
-    def cancel_input(self, chat_id):
-        self.states.pop(chat_id, None)
+    async def cancel_input(self, chat_id):
+        await self.clear_conversation(chat_id)
         job = self.jobs.get(chat_id)
         if job and job.kind in ('login', 'feature:prepare_reply'):
             job.cancel.set()
@@ -259,103 +240,103 @@ class PublicBot(FeatureUI):
         if pending and pending[0] == 'prepare_reply':
             self.pending_actions.pop(chat_id, None)
 
-    def submit_feature(self, chat_id, action, values):
+    async def submit_feature(self, chat_id, action, values):
         user = self.catalog.user(chat_id)
         if chat_id in self.removing:
-            return self.send(chat_id, 'disconnecting')
+            return await self.send(chat_id, 'disconnecting')
         if not user['site_user']:
-            return self.send(chat_id, 'not_connected')
+            return await self.send(chat_id, 'not_connected')
         if user['status'] == 'expired':
-            return self.send(chat_id, 'session_expired')
+            return await self.send(chat_id, 'session_expired')
         if chat_id in self.pending_actions or chat_id in self.jobs and self.jobs[chat_id].kind != 'poll':
-            return self.send(chat_id, 'request_busy')
+            return await self.send(chat_id, 'request_busy')
         self.pending_actions[chat_id] = (action, dict(values), user['storage'])
         key = {'recent': 'recent_loading', 'summary': 'summary_loading',
                'prepare_reply': 'reply_preparing', 'send_reply': 'reply_sending'}[action]
-        self.send(chat_id, key)
+        await self.send(chat_id, key)
 
-    def dispatch_features(self):
+    async def dispatch_features(self):
         for chat_id, (action, values, storage) in list(self.pending_actions.items()):
             if chat_id in self.jobs or len(self.jobs) >= WORKERS:
                 continue
             del self.pending_actions[chat_id]
             user = self.catalog.user(chat_id)
             if user['storage'] != storage or chat_id in self.removing:
-                self.safe_send(chat_id, 'reply_stale' if action.endswith('reply') else 'not_connected')
+                await self.safe_send(chat_id, 'reply_stale' if action.endswith('reply') else 'not_connected')
                 continue
             cancel = threading.Event()
-            future = self.executor.submit(self.run_feature, user, action, values, cancel)
+            future = asyncio.get_running_loop().run_in_executor(self.executor, self.run_feature, user, action, values, cancel)
             self.jobs[chat_id] = Job(future, 'feature:' + action, cancel, user['language'])
 
-    def set_timezone(self, chat_id, value):
-        self.cancel_input(chat_id)
+    async def set_timezone(self, chat_id, value):
+        await self.cancel_input(chat_id)
         match = re.fullmatch(r'([+-])(\d{1,2})(?::([0-5]\d))?', value.strip())
         if not match:
-            return self.send(chat_id, 'timezone_invalid')
+            return await self.send(chat_id, 'timezone_invalid')
         minutes = (int(match[2]) * 60 + int(match[3] or 0)) * (1 if match[1] == '+' else -1)
         if not -720 <= minutes <= 840:
-            return self.send(chat_id, 'timezone_invalid')
+            return await self.send(chat_id, 'timezone_invalid')
         self.catalog.update(chat_id, timezone_minutes=minutes)
-        return self.send(chat_id, 'timezone_saved', zone=timezone_label(minutes))
+        return await self.send(chat_id, 'timezone_saved', zone=timezone_label(minutes))
 
-    def command(self, chat_id, command, argument=''):
+    async def command(self, chat_id, command, argument=''):
         user = self.catalog.user(chat_id)
         if chat_id in self.removing:
-            return self.send(chat_id, 'disconnecting')
+            return await self.send(chat_id, 'disconnecting')
         if command == 'cancel' and self.pending_actions.get(chat_id, (None,))[0] == 'send_reply':
             self.pending_actions.pop(chat_id, None)
-            self.states.pop(chat_id, None)
-            return self.send(chat_id, 'cancelled')
+            await self.clear_conversation(chat_id)
+            return await self.send(chat_id, 'cancelled')
         if command == 'cancel' and chat_id in self.jobs and self.jobs[chat_id].kind == 'feature:send_reply':
-            return self.send(chat_id, 'request_busy')
+            return await self.send(chat_id, 'request_busy')
         if command in ('settings', 'filters', 'quiet', 'grouping', 'digest', 'recent', 'summary'):
-            self.cancel_input(chat_id)
-            return self.feature_command(chat_id, command, argument)
+            await self.cancel_input(chat_id)
+            return await self.feature_command(chat_id, command, argument)
         if command in ('start', 'language', 'timezone', 'cancel'):
-            self.cancel_input(chat_id)
+            await self.cancel_input(chat_id)
         if command in ('start', 'language'):
-            return self.languages(chat_id)
+            return await self.languages(chat_id)
         if command == 'timezone':
-            return self.send(chat_id, 'timezone_choose', keyboard={'inline_keyboard': [
+            return await self.send(chat_id, 'timezone_choose', keyboard={'inline_keyboard': [
                 [{'text': 'UTC+5', 'callback_data': 'tz_300'}, {'text': 'UTC+8', 'callback_data': 'tz_480'}],
                 [{'text': 'UTC+3', 'callback_data': 'tz_180'}, {'text': 'UTC', 'callback_data': 'tz_0'}],
             ]})
         if command == 'cancel':
-            return self.send(chat_id, 'cancelled')
+            return await self.send(chat_id, 'cancelled')
         if command == 'help':
-            return self.send(chat_id, 'help')
+            return await self.send(chat_id, 'help')
         if command == 'connect':
             if chat_id in self.jobs and self.jobs[chat_id].kind == 'login':
-                return self.send(chat_id, 'busy')
+                return await self.send(chat_id, 'busy')
             if user['site_user'] and user['status'] != 'expired':
-                return self.send(chat_id, 'already')
-            self.states[chat_id] = {'step': 'login', 'expires': time.time() + INPUT_TTL}
-            return self.send(chat_id, 'login', keyboard={'inline_keyboard': [[
+                return await self.send(chat_id, 'already')
+            await self.set_conversation(chat_id, {'step': 'login', 'expires': time.time() + INPUT_TTL})
+            return await self.send(chat_id, 'login', keyboard={'inline_keyboard': [[
                 {'text': tr(user['language'], 'cancel'), 'callback_data': 'cancel'}]]})
         if command == 'status':
             if not user['site_user']:
-                return self.send(chat_id, 'not_connected')
+                return await self.send(chat_id, 'not_connected')
             key = 'expired_state' if user['status'] == 'expired' else 'active' if user['enabled'] else 'paused_state'
-            return self.send(chat_id, 'account', name=user['name'], state=tr(user['language'], key))
+            return await self.send(chat_id, 'account', name=user['name'], state=tr(user['language'], key))
         if command in ('pause', 'resume'):
             if not user['site_user']:
-                return self.send(chat_id, 'not_connected')
+                return await self.send(chat_id, 'not_connected')
             if user['status'] == 'expired':
-                return self.send(chat_id, 'session_expired')
+                return await self.send(chat_id, 'session_expired')
             self.catalog.update(chat_id, enabled=int(command == 'resume'), status='active', next_run=0)
             if command == 'pause' and chat_id in self.jobs:
                 self.jobs[chat_id].cancel.set()
-            return self.send(chat_id, 'paused' if command == 'pause' else 'resumed')
+            return await self.send(chat_id, 'paused' if command == 'pause' else 'resumed')
         if command == 'disconnect':
-            self.cancel_input(chat_id)
+            await self.cancel_input(chat_id)
             if not user['site_user'] and chat_id not in self.jobs:
-                return self.send(chat_id, 'not_connected')
-            return self.send(chat_id, 'confirm_disconnect', keyboard={'inline_keyboard': [[
+                return await self.send(chat_id, 'not_connected')
+            return await self.send(chat_id, 'confirm_disconnect', keyboard={'inline_keyboard': [[
                 {'text': tr(user['language'], 'yes_disconnect'), 'callback_data': 'unlink_yes'},
                 {'text': tr(user['language'], 'cancel'), 'callback_data': 'cancel'},
             ]]})
 
-    def remove_account(self, chat_id):
+    async def remove_account(self, chat_id):
         user = self.catalog.user(chat_id)
         if user['storage']:
             path = self.user_path(chat_id, user['storage'])
@@ -363,104 +344,131 @@ class PublicBot(FeatureUI):
                 shutil.rmtree(path)
         self.catalog.update(chat_id, site_user=None, name=None, storage=None, enabled=0,
                             status='none', next_poll=0, next_run=0, failures=0, pending_manual=0)
-        self.states.pop(chat_id, None)
+        await self.clear_conversation(chat_id)
         self.removing.discard(chat_id)
-        self.send(chat_id, 'disconnected')
+        await self.send(chat_id, 'disconnected')
 
-    def unlink(self, chat_id):
-        self.cancel_input(chat_id)
+    async def unlink(self, chat_id):
+        await self.cancel_input(chat_id)
         self.pending_actions.pop(chat_id, None)
         self.catalog.update(chat_id, enabled=0)
         self.removing.add(chat_id)
         if chat_id in self.jobs:
             self.jobs[chat_id].cancel.set()
-            self.send(chat_id, 'disconnecting')
+            await self.send(chat_id, 'disconnecting')
         else:
-            self.remove_account(chat_id)
+            await self.remove_account(chat_id)
 
-    def delete_input(self, chat_id, message_id):
-        self.telegram.call('deleteMessage', {'chat_id': chat_id, 'message_id': message_id})
+    async def delete_input(self, chat_id, message_id):
+        await self.telegram.call('deleteMessage', {'chat_id': chat_id, 'message_id': message_id})
 
-    def handle(self, update):
-        callback = update.get('callback_query')
-        message = callback.get('message', {}) if callback else update.get('message', {})
-        chat = message.get('chat', {})
-        sender = (callback or message).get('from', {})
-        chat_id = chat.get('id')
-        if chat.get('type') != 'private' or chat_id != sender.get('id') or sender.get('is_bot'):
+    def state(self, chat_id):
+        return FSMContext(self.dispatcher.storage, StorageKey(bot_id=self.bot.id, chat_id=chat_id, user_id=chat_id))
+
+    async def get_conversation(self, chat_id):
+        context = self.state(chat_id)
+        if await context.get_state() is None:
+            return None
+        data = await context.get_data()
+        if data.get('expires', 0) < time.time():
+            await self.clear_conversation(chat_id)
+            return None
+        return data
+
+    async def set_conversation(self, chat_id, data):
+        context = self.state(chat_id)
+        await context.set_state(getattr(Conversation, data['step']))
+        await context.set_data(data)
+        self.active_conversations.add(chat_id)
+
+    async def clear_conversation(self, chat_id):
+        await self.state(chat_id).clear()
+        self.active_conversations.discard(chat_id)
+
+    async def handle(self, update):
+        """Feed an update through aiogram; useful for isolated router integration tests."""
+        parsed = update if isinstance(update, Update) else Update.model_validate(update, context={'bot': self.bot})
+        return await self.dispatcher.feed_update(self.bot, parsed)
+
+    def register_sender(self, chat_id, sender):
+        self.catalog.user(chat_id, 'ru' if (sender.language_code or '').startswith('ru') else 'tk')
+
+    async def on_command(self, message: Message, command: CommandObject):
+        chat_id = message.chat.id
+        self.register_sender(chat_id, message.from_user)
+        if command.args:
+            try:
+                await self.delete_input(chat_id, message.message_id)
+            except ServiceError:
+                pass
+        if command.command == 'timezone' and command.args:
+            return await self.set_timezone(chat_id, command.args)
+        return await self.command(chat_id, command.command, (command.args or '').strip())
+
+    async def on_callback(self, callback: CallbackQuery):
+        message = callback.message
+        chat_id = message.chat.id
+        self.register_sender(chat_id, callback.from_user)
+        await self.telegram.call('answerCallbackQuery', {'callback_query_id': callback.id})
+        action = callback.data or ''
+        if action in ('lang_ru', 'lang_tk'):
+            await self.cancel_input(chat_id)
+            self.catalog.update(chat_id, language=action[-2:])
+            if self.catalog.user(chat_id)['site_user']:
+                return await self.command(chat_id, 'status')
+            return await self.send(chat_id, 'welcome')
+        if action == 'unlink_yes':
+            return await self.unlink(chat_id)
+        if action in ('tz_300', 'tz_480', 'tz_180', 'tz_0'):
+            await self.cancel_input(chat_id)
+            minutes = int(action[3:])
+            self.catalog.update(chat_id, timezone_minutes=minutes)
+            return await self.send(chat_id, 'timezone_saved', zone=timezone_label(minutes))
+        if action in ('connect', 'status', 'pause', 'resume', 'language', 'timezone', 'disconnect', 'cancel'):
+            return await self.command(chat_id, action)
+        return await self.feature_callback(chat_id, action, message.message_id)
+
+    async def on_text(self, message: Message, state: FSMContext):
+        chat_id = message.chat.id
+        self.register_sender(chat_id, message.from_user)
+        if await self.feature_input(chat_id, message):
             return
-        language = 'ru' if sender.get('language_code', '').startswith('ru') else 'tk'
-        self.catalog.user(chat_id, language)
-        if callback:
-            self.telegram.call('answerCallbackQuery', {'callback_query_id': callback['id']})
-            action = callback.get('data')
-            if action in ('lang_ru', 'lang_tk'):
-                self.cancel_input(chat_id)
-                self.catalog.update(chat_id, language=action[-2:])
-                if self.catalog.user(chat_id)['site_user']:
-                    return self.command(chat_id, 'status')
-                return self.send(chat_id, 'welcome')
-            if action == 'unlink_yes':
-                return self.unlink(chat_id)
-            if action in ('tz_300', 'tz_480', 'tz_180', 'tz_0'):
-                self.cancel_input(chat_id)
-                minutes = int(action[3:])
-                self.catalog.update(chat_id, timezone_minutes=minutes)
-                return self.send(chat_id, 'timezone_saved', zone=timezone_label(minutes))
-            if action in ('connect', 'status', 'pause', 'resume', 'language', 'timezone', 'disconnect', 'cancel'):
-                return self.command(chat_id, action)
-            self.feature_callback(chat_id, action or '', message.get('message_id'))
-            return
-        text = message.get('text', '')
-        command = text.split(maxsplit=1)[0].split('@')[0][1:] if text.startswith('/') else ''
-        commands = {'start', 'connect', 'status', 'pause', 'resume', 'language', 'timezone', 'disconnect', 'cancel', 'help',
-                    'settings', 'filters', 'quiet', 'grouping', 'digest', 'recent', 'summary'}
-        if command in commands:
-            # Commands with arguments could accidentally contain credentials; delete them too.
-            if len(text.split(maxsplit=1)) > 1:
-                try:
-                    self.delete_input(chat_id, message['message_id'])
-                except ServiceError:
-                    pass
-            if command == 'timezone' and len(text.split(maxsplit=1)) > 1:
-                return self.set_timezone(chat_id, text.split(maxsplit=1)[1])
-            argument = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ''
-            return self.command(chat_id, command, argument)
-        if self.feature_input(chat_id, message):
-            return
-        state = self.states.get(chat_id)
+        text = message.text or ''
+        conversation = await self.get_conversation(chat_id)
         try:
-            # Delete all non-command input, including credentials sent after a restart.
-            self.delete_input(chat_id, message['message_id'])
+            # Password deletion precedes authentication, even after an interrupted conversation.
+            await self.delete_input(chat_id, message.message_id)
         except ServiceError:
-            if state and state['step'] == 'password':
-                self.states.pop(chat_id, None)
-                return self.send(chat_id, 'delete_failed')
-        if not state and chat_id in self.jobs and self.jobs[chat_id].kind == 'login':
-            return self.send(chat_id, 'busy')
-        if not state or state['expires'] < time.time() or message.get('date', time.time()) < time.time() - INPUT_TTL:
-            self.states.pop(chat_id, None)
-            return self.send(chat_id, 'expired_input')
-        if state['step'] == 'login':
+            if conversation and conversation['step'] == 'password':
+                await self.clear_conversation(chat_id)
+                return await self.send(chat_id, 'delete_failed')
+        if not conversation and chat_id in self.jobs and self.jobs[chat_id].kind == 'login':
+            return await self.send(chat_id, 'busy')
+        if not conversation or message.date.timestamp() < time.time() - INPUT_TTL:
+            await self.clear_conversation(chat_id)
+            return await self.send(chat_id, 'expired_input')
+        if conversation['step'] == 'login':
             if not text.strip() or len(text.strip()) > 254:
-                return self.send(chat_id, 'invalid_login')
-            self.states[chat_id] = {'step': 'password', 'identifier': text.strip(), 'expires': time.time() + INPUT_TTL}
-            return self.send(chat_id, 'password', keyboard={'inline_keyboard': [[
+                return await self.send(chat_id, 'invalid_login')
+            await self.set_conversation(chat_id, {'step': 'password', 'identifier': text.strip(), 'expires': time.time() + INPUT_TTL})
+            return await self.send(chat_id, 'password', keyboard={'inline_keyboard': [[
                 {'text': tr(self.catalog.user(chat_id)['language'], 'cancel'), 'callback_data': 'cancel'}]]})
-        if state['step'] == 'password':
+        if conversation['step'] == 'password':
             if not text or len(text) > 1024:
-                return self.send(chat_id, 'invalid_password')
+                return await self.send(chat_id, 'invalid_password')
             if chat_id in self.jobs or len(self.jobs) >= WORKERS:
-                return self.send(chat_id, 'busy')
+                return await self.send(chat_id, 'busy')
             if not self.catalog.attempt(chat_id):
-                self.states.pop(chat_id, None)
-                return self.send(chat_id, 'rate_limit')
-            self.states.pop(chat_id, None)
-            lang = self.catalog.user(chat_id)['language']
+                await self.clear_conversation(chat_id)
+                return await self.send(chat_id, 'rate_limit')
+            await self.clear_conversation(chat_id)
+            language = self.catalog.user(chat_id)['language']
             cancel = threading.Event()
-            future = self.executor.submit(self.login_job, state['identifier'], text, lang, cancel)
-            self.jobs[chat_id] = Job(future, 'login', cancel, lang)
-            self.send(chat_id, 'checking')
+            future = asyncio.get_running_loop().run_in_executor(
+                self.executor, self.login_job, conversation['identifier'], text, language, cancel)
+            self.jobs[chat_id] = Job(future, 'login', cancel, language)
+            text = conversation = None
+            await self.send(chat_id, 'checking')
 
     def login_job(self, identifier, password, language, cancel):
         directory = Path(tempfile.mkdtemp(prefix='login-', dir=self.pending_root))
@@ -484,33 +492,44 @@ class PublicBot(FeatureUI):
         finally:
             password = identifier = None
 
-    def poll_job(self, user, cancel):
+    def prepare_poll(self, user, cancel):
         directory = self.user_path(user['chat_id'], user['storage'])
         site = self.site_factory(directory, self.vault)
         store = FeatureStore(directory / 'notifications.sqlite3', user['site_user'])
         next_poll = user['next_poll']
-        sent = 0
         try:
             if cancel.is_set():
-                pending, manual, due = store.pending(user, time.time())
-                return next_poll, sent, pending, manual, due
+                return next_poll, None
             if user['enabled'] and time.time() >= next_poll:
                 store.observe(site.notifications(), user=user)
                 next_poll = time.time() + INTERVAL
             if user['enabled']:
                 store.schedule_digest(user, time.time())
-            row = store.delivery(user, time.time())
-            if row and not cancel.is_set():
-                self.telegram.call('sendMessage', {'chat_id': user['chat_id'], **queued_message(row[1], row[2])})
-                with store.db:
-                    store.db.execute('DELETE FROM outbox WHERE seq=?', (row[0],))
-                sent = 1
-            pending, manual, due = store.pending(user, time.time())
-            return next_poll, sent, pending, manual, due
+            return next_poll, store.delivery(user, time.time())
         finally:
             store.db.close()
 
-    def finish_login(self, chat_id, result, job):
+    def complete_poll(self, user, next_poll, sent_seq):
+        store = self.feature_store(user)
+        try:
+            if sent_seq is not None:
+                with store.db:
+                    store.db.execute('DELETE FROM outbox WHERE seq=?', (sent_seq,))
+            pending, manual, due = store.pending(user, time.time())
+            return next_poll, int(sent_seq is not None), pending, manual, due
+        finally:
+            store.db.close()
+
+    async def poll_job(self, user, cancel):
+        loop = asyncio.get_running_loop()
+        next_poll, row = await loop.run_in_executor(self.executor, self.prepare_poll, user, cancel)
+        sent_seq = None
+        if row and not cancel.is_set():
+            await self.telegram.call('sendMessage', {'chat_id': user['chat_id'], **queued_message(row[1], row[2])})
+            sent_seq = row[0]
+        return await loop.run_in_executor(self.executor, self.complete_poll, user, next_poll, sent_seq)
+
+    async def finish_login(self, chat_id, result, job):
         directory = result['directory']
         try:
             if job.cancel.is_set() or chat_id in self.removing:
@@ -519,11 +538,11 @@ class PublicBot(FeatureUI):
             other = self.catalog.db.execute('SELECT chat_id FROM users WHERE site_user=? AND chat_id!=?',
                                             (result['site_user'], chat_id)).fetchone()
             if other:
-                self.send(chat_id, 'account_used')
+                await self.send(chat_id, 'account_used')
                 return
             # Reauthentication may only restore the same account. Switching requires explicit unlink.
             if old['site_user'] and old['site_user'] != result['site_user']:
-                self.send(chat_id, 'already')
+                await self.send(chat_id, 'already')
                 return
             storage = uuid.uuid4().hex
             target = self.user_path(chat_id, storage)
@@ -542,22 +561,22 @@ class PublicBot(FeatureUI):
                 raise
             if old['storage']:
                 shutil.rmtree(self.user_path(chat_id, old['storage']))
-            self.send(chat_id, 'connected', name=result['name'])
+            await self.send(chat_id, 'connected', name=result['name'])
         finally:
             if directory.exists():
                 shutil.rmtree(directory)
 
-    def reap(self):
+    async def reap(self):
         for chat_id, job in list(self.jobs.items()):
             if not job.future.done():
                 continue
             del self.jobs[chat_id]
             try:
-                result = job.future.result()
+                result = await job.future
                 if job.kind == 'login':
-                    self.finish_login(chat_id, result, job)
+                    await self.finish_login(chat_id, result, job)
                 elif job.kind.startswith('feature:'):
-                    self.finish_feature(chat_id, result, job)
+                    await self.finish_feature(chat_id, result, job)
                 else:
                     next_poll, sent, pending = result[:3]
                     manual, due = result[3:] if len(result) > 3 else (False, time.time() + 1.2)
@@ -574,27 +593,27 @@ class PublicBot(FeatureUI):
                 if not job.cancel.is_set() and chat_id not in self.removing:
                     if job.kind == 'login':
                         key = 'login_failed' if isinstance(error, ServiceError) and error.status in (400, 401, 403) else 'unavailable'
-                        self.safe_send(chat_id, key)
+                        await self.safe_send(chat_id, key)
                     elif job.kind.startswith('feature:'):
-                        self.feature_error(chat_id, job.kind.split(':', 1)[1], error)
+                        await self.feature_error(chat_id, job.kind.split(':', 1)[1], error)
                     else:
-                        self.poll_error(chat_id, error)
+                        await self.poll_error(chat_id, error)
             if chat_id in self.removing:
-                self.remove_account(chat_id)
+                await self.remove_account(chat_id)
 
-    def safe_send(self, chat_id, key, **values):
+    async def safe_send(self, chat_id, key, **values):
         try:
-            self.send(chat_id, key, **values)
+            await self.send(chat_id, key, **values)
         except ServiceError:
             LOG.warning('Interface message could not be delivered')
 
-    def poll_error(self, chat_id, error):
+    async def poll_error(self, chat_id, error):
         user = self.catalog.user(chat_id)
         # Identify the failing service as well as status: Telegram 403 means bot blocked.
         if (isinstance(error, InvalidToken) or
                 isinstance(error, ServiceError) and error.status in (401, 403) and str(error).startswith('Teswirler')):
             self.catalog.update(chat_id, enabled=0, status='expired')
-            self.safe_send(chat_id, 'session_expired')
+            await self.safe_send(chat_id, 'session_expired')
         elif isinstance(error, ServiceError) and error.status == 403:
             self.catalog.update(chat_id, enabled=0, status='blocked')
         else:
@@ -603,8 +622,8 @@ class PublicBot(FeatureUI):
                         min(3600, getattr(error, 'retry_after', 0)))
             self.catalog.update(chat_id, failures=failures, next_run=time.time() + delay)
 
-    def schedule(self):
-        self.dispatch_features()
+    async def schedule(self):
+        await self.dispatch_features()
         for user in self.catalog.due(time.time()):
             chat_id = user['chat_id']
             # Reserve half the slots for new logins and keep at most one job per chat.
@@ -613,7 +632,7 @@ class PublicBot(FeatureUI):
             if chat_id in self.jobs or chat_id in self.removing or chat_id in self.pending_actions:
                 continue
             cancel = threading.Event()
-            self.jobs[chat_id] = Job(self.executor.submit(self.poll_job, user, cancel),
+            self.jobs[chat_id] = Job(asyncio.create_task(self.poll_job(user, cancel)),
                                      'poll', cancel, user['language'])
 
     def import_legacy(self):
@@ -641,7 +660,7 @@ class PublicBot(FeatureUI):
                     LOG.info('Existing personal subscription migrated')
         self.catalog.meta('legacy_imported', '1')
 
-    def configure(self):
+    async def configure(self):
         if self.catalog.meta('interface_version') == '3':
             return
         for language in ('', 'ru', 'tk'):
@@ -649,59 +668,57 @@ class PublicBot(FeatureUI):
             commands = [{'command': command, 'description': tr(lang, 'command_' + command)} for command in
                         ('start', 'connect', 'recent', 'summary', 'settings', 'filters', 'quiet', 'grouping', 'digest',
                          'status', 'pause', 'resume', 'language', 'timezone', 'disconnect', 'cancel', 'help')]
-            self.telegram.call('setMyCommands', {'commands': commands, 'language_code': language})
-            self.telegram.call('setMyDescription', {'description': tr(lang, 'description'), 'language_code': language})
-            self.telegram.call('setMyShortDescription', {'short_description': tr(lang, 'short_description'), 'language_code': language})
+            await self.telegram.call('setMyCommands', {'commands': commands, 'language_code': language})
+            await self.telegram.call('setMyDescription', {'description': tr(lang, 'description'), 'language_code': language})
+            await self.telegram.call('setMyShortDescription', {'short_description': tr(lang, 'short_description'), 'language_code': language})
         self.catalog.meta('interface_version', '3')
 
-    def loop(self):
+    async def worker_loop(self):
+        while True:
+            await self.reap()
+            await self.schedule()
+            for chat_id in list(self.active_conversations):
+                await self.get_conversation(chat_id)
+            await asyncio.sleep(.25)
+
+    async def run(self):
         config = read_json(self.private / 'telegram.json')
-        identity = self.telegram.call('getMe')
+        identity = await self.telegram.call('getMe')
         if identity['id'] != config['bot_id']:
             raise RuntimeError('Telegram bot identity mismatch')
-        if self.telegram.call('getWebhookInfo').get('url'):
-            raise RuntimeError('Existing Telegram webhook was preserved; long polling cannot start')
+        if (await self.telegram.call('getWebhookInfo')).get('url'):
+            raise RuntimeError('Existing Telegram webhook was preserved; polling cannot start')
         self.import_legacy()
         try:
-            self.configure()
+            await self.configure()
         except ServiceError:
             LOG.warning('Telegram profile setup deferred until next restart')
-        LOG.info('Public bilingual bot started')
-        while True:
-            self.reap()
-            self.schedule()
-            # Expire usernames held during abandoned login conversations.
-            now = time.time()
-            self.states = {key: state for key, state in self.states.items() if state['expires'] >= now}
-            try:
-                updates = self.telegram.call('getUpdates', {
-                    'offset': self.offset, 'timeout': 1, 'limit': 50,
-                    'allowed_updates': ['message', 'callback_query'],
-                })
-            except ServiceError as error:
-                LOG.warning('Telegram update polling failed: status=%s', error.status)
-                time.sleep(min(30, max(2, error.retry_after)))
-                continue
-            for update in updates:
-                try:
-                    self.handle(update)
-                except Exception as error:
-                    LOG.warning('Update handling failed: %s', type(error).__name__)
-                finally:
-                    self.offset = max(self.offset, update['update_id'] + 1)
-                    self.catalog.meta('update_offset', self.offset)
-                    update.clear()
-            # Never store or log Telegram updates (they can contain passwords).
-            updates.clear()
-            if not updates:
-                time.sleep(.1)
+        LOG.info('Public bilingual bot started with aiogram 3')
+        worker = asyncio.create_task(self.worker_loop(), name='notification-worker')
+        poller = asyncio.create_task(self.dispatcher.start_polling(
+            self.bot, allowed_updates=self.dispatcher.resolve_used_update_types(), polling_timeout=20,
+            handle_as_tasks=False, close_bot_session=False), name='aiogram-polling')
+        try:
+            done, _ = await asyncio.wait((worker, poller), return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                await task
+        finally:
+            for task in (worker, poller):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(worker, poller, return_exceptions=True)
 
-    def close(self):
-        self.states.clear()
+    async def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        for chat_id in list(self.active_conversations):
+            await self.clear_conversation(chat_id)
         self.pending_actions.clear()
         for job in self.jobs.values():
             job.cancel.set()
-        self.executor.shutdown(wait=True, cancel_futures=True)
+        # Let in-flight site requests finish before closing sessions and files.
+        await asyncio.gather(*(job.future for job in self.jobs.values()), return_exceptions=True)
         for job in self.jobs.values():
             if job.kind == 'login' and not job.future.cancelled():
                 try:
@@ -709,30 +726,35 @@ class PublicBot(FeatureUI):
                     shutil.rmtree(result['directory'])
                 except Exception:
                     pass
+        await asyncio.to_thread(self.executor.shutdown, wait=True, cancel_futures=True)
+        await self.dispatcher.storage.close()
+        await self.dispatcher.fsm.events_isolation.close()
+        await self.telegram.close()
         self.catalog.db.close()
 
 
-def main():
+async def main():
     os.umask(0o077)
     private_directory(ROOT / 'logs')
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s', handlers=[
         logging.StreamHandler(), RotatingFileHandler(ROOT / 'logs' / 'public.log', maxBytes=1_000_000,
                                                     backupCount=3, encoding='utf-8')])
+    # Poller errors from third-party libraries may contain URLs or update bodies.
+    for name in ('aiogram', 'aiogram.event', 'aiogram.dispatcher', 'aiohttp'):
+        logging.getLogger(name).setLevel(logging.CRITICAL)
     app = None
     try:
         with single_instance():
             app = PublicBot()
-            app.loop()
-    except KeyboardInterrupt:
-        LOG.info('Public bot stopped')
+            try:
+                await app.run()
+            finally:
+                await app.close()
     except Exception as error:
         LOG.error('Public bot stopped: %s', type(error).__name__)
         return 1
-    finally:
-        if app:
-            app.close()
     return 0
 
 
 if __name__ == '__main__':
-    raise SystemExit(main())
+    raise SystemExit(asyncio.run(main()))

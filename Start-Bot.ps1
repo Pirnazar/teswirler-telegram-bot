@@ -5,7 +5,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $PSScriptRoot '.secrets\telegram.jso
     throw 'Connect Telegram first: python bot.py pair'
 }
 $taskPython = $null
-foreach ($taskRelativePython in @('.venv\Scripts\python.exe', '.venv-public\Scripts\python.exe')) {
+foreach ($taskRelativePython in @('.venv-aiogram\Scripts\python.exe', '.venv\Scripts\python.exe', '.venv-public\Scripts\python.exe')) {
     $taskCandidatePython = Join-Path $PSScriptRoot $taskRelativePython
     if (Test-Path -LiteralPath $taskCandidatePython) { $taskPython = $taskCandidatePython; break }
 }

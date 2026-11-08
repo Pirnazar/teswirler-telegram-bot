@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import closing
 from datetime import datetime, timezone
 import json
@@ -285,8 +286,8 @@ class ActionSite(FakeSite):
         return {'id':'sent-message'}
 
 
-class FeatureBotTests(unittest.TestCase):
-    def setUp(self):
+class FeatureBotTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
         self.temp=tempfile.TemporaryDirectory()
         self.telegram=FakeTelegram()
         ActionSite.rows={}
@@ -295,27 +296,27 @@ class FeatureBotTests(unittest.TestCase):
         ActionSite.failure=None
         self.app=PublicBot(Path(self.temp.name),self.telegram,ActionSite)
         self.addCleanup(self.temp.cleanup)
-        self.addCleanup(self.app.close)
-        self.connect(111,'one')
+        self.addAsyncCleanup(self.app.close)
+        await self.connect(111,'one')
 
-    def finish(self,chat=111,raises=False):
+    async def finish(self,chat=111,raises=False):
         future=self.app.jobs[chat].future
         if raises:
             with self.assertRaises(Exception):
-                future.result(timeout=5)
+                await asyncio.wait_for(asyncio.shield(future), timeout=5)
         else:
-            future.result(timeout=5)
-        self.app.reap()
+            await asyncio.wait_for(asyncio.shield(future), timeout=5)
+        await self.app.reap()
 
-    def connect(self,chat,account):
+    async def connect(self,chat,account):
         for text in ('/connect',account,'password-not-stored'):
-            self.app.handle(message(chat,text))
-        self.finish(chat)
+            await self.app.handle(message(chat,text))
+        await self.finish(chat)
 
-    def action(self,action,values=None,chat=111,raises=False):
-        self.app.submit_feature(chat,action,values or {})
-        self.app.dispatch_features()
-        self.finish(chat,raises)
+    async def action(self,action,values=None,chat=111,raises=False):
+        await self.app.submit_feature(chat,action,values or {})
+        await self.app.dispatch_features()
+        await self.finish(chat,raises)
 
     def target_token(self):
         user=self.app.catalog.user(111)
@@ -326,17 +327,17 @@ class FeatureBotTests(unittest.TestCase):
         finally:
             store.db.close()
 
-    def prepare_draft(self):
-        self.action('prepare_reply',{'token':self.target_token()})
-        self.assertEqual(self.app.states[111]['name'],'Verified person')
-        self.app.handle(message(111,'Actual answer <b>literal</b> & text'))
+    async def prepare_draft(self):
+        await self.action('prepare_reply',{'token':self.target_token()})
+        self.assertEqual((await self.app.get_conversation(111))['name'],'Verified person')
+        await self.app.handle(message(111,'Actual answer <b>literal</b> & text'))
         self.assertFalse(ActionSite.posts)
-        return self.app.states[111]['nonce']
+        return (await self.app.get_conversation(111))['nonce']
 
-    def test_recent_is_accessible_while_paused_and_manual_delivery_drains(self):
-        self.app.handle(message(111,'/pause'))
+    async def test_recent_is_accessible_while_paused_and_manual_delivery_drains(self):
+        await self.app.handle(message(111,'/pause'))
         ActionSite.rows['one']=[notification(str(i)) for i in range(12)]
-        self.action('recent',{'count':5})
+        await self.action('recent',{'count':5})
         user=self.app.catalog.user(111)
         self.assertTrue(user['pending_manual'])
         self.assertFalse(user['enabled'])
@@ -346,88 +347,88 @@ class FeatureBotTests(unittest.TestCase):
             self.assertEqual(store.db.execute("SELECT COUNT(*) FROM outbox WHERE kind='manual'").fetchone()[0],5)
         finally:
             store.db.close()
-        self.app.poll_job(user,threading.Event())
+        await self.app.poll_job(user,threading.Event())
         deliveries=[b for m,b in self.telegram.calls if m=='sendMessage' and b.get('parse_mode')=='HTML']
         self.assertTrue(deliveries)
 
-    def test_settings_filters_and_quiet_are_scoped_and_persistent(self):
-        self.connect(222,'two')
-        self.app.handle(callback(111,'filter:likes'))
-        self.app.handle(message(111,'/quiet 23:00-08:00'))
-        self.app.handle(message(111,'/digest 20:30'))
+    async def test_settings_filters_and_quiet_are_scoped_and_persistent(self):
+        await self.connect(222,'two')
+        await self.app.handle(callback(111,'filter:likes'))
+        await self.app.handle(message(111,'/quiet 23:00-08:00'))
+        await self.app.handle(message(111,'/digest 20:30'))
         self.assertEqual(self.app.catalog.user(111)['muted'],'["likes"]')
         self.assertEqual(self.app.catalog.user(111)['quiet_start'],1380)
         self.assertEqual(self.app.catalog.user(111)['digest_minute'],1230)
         self.assertEqual(self.app.catalog.user(222)['muted'],'[]')
         for invalid in ('24:00-08:00','23:00-23:00','oops'):
-            self.app.handle(message(111,'/quiet '+invalid))
+            await self.app.handle(message(111,'/quiet '+invalid))
             self.assertEqual(self.app.catalog.user(111)['quiet_start'],1380)
 
-    def test_reply_requires_verification_confirmation_and_is_sent_once(self):
-        nonce=self.prepare_draft()
-        self.app.handle(callback(111,'send:'+nonce))
-        self.app.dispatch_features()
-        self.finish()
-        self.app.handle(callback(111,'send:'+nonce))
+    async def test_reply_requires_verification_confirmation_and_is_sent_once(self):
+        nonce=await self.prepare_draft()
+        await self.app.handle(callback(111,'send:'+nonce))
+        await self.app.dispatch_features()
+        await self.finish()
+        await self.app.handle(callback(111,'send:'+nonce))
         self.assertEqual(len(ActionSite.posts),1)
         self.assertEqual(ActionSite.posts[0],('one','/conversations/room/messages',{'content':'Actual answer <b>literal</b> & text'}))
         self.assertFalse(self.app.pending_actions)
 
-    def test_forwarded_reply_token_cannot_access_another_account(self):
+    async def test_forwarded_reply_token_cannot_access_another_account(self):
         token=self.target_token()
-        self.connect(222,'two')
-        self.action('prepare_reply',{'token':token},222,raises=True)
-        self.assertNotIn(222,self.app.states)
+        await self.connect(222,'two')
+        await self.action('prepare_reply',{'token':token},222,raises=True)
+        self.assertIsNone(await self.app.get_conversation(222))
         self.assertFalse(ActionSite.posts)
 
-    def test_changed_recipient_after_preview_is_rejected(self):
-        nonce=self.prepare_draft()
+    async def test_changed_recipient_after_preview_is_rejected(self):
+        nonce=await self.prepare_draft()
         ActionSite.conversations['one']['room']['participants']=[{'id':'different','name':'Different recipient'}]
-        self.app.handle(callback(111,'send:'+nonce))
-        self.app.dispatch_features()
-        self.finish(raises=True)
+        await self.app.handle(callback(111,'send:'+nonce))
+        await self.app.dispatch_features()
+        await self.finish(raises=True)
         self.assertFalse(ActionSite.posts)
 
-    def test_unknown_network_outcome_is_not_retried(self):
-        nonce=self.prepare_draft()
+    async def test_unknown_network_outcome_is_not_retried(self):
+        nonce=await self.prepare_draft()
         ActionSite.failure=ServiceError('Teswirler',0)
-        self.app.handle(callback(111,'send:'+nonce))
-        self.app.dispatch_features()
-        self.finish(raises=True)
-        self.app.handle(callback(111,'send:'+nonce))
+        await self.app.handle(callback(111,'send:'+nonce))
+        await self.app.dispatch_features()
+        await self.finish(raises=True)
+        await self.app.handle(callback(111,'send:'+nonce))
         self.assertEqual(len(ActionSite.posts),1)
         self.assertTrue(any('могло уже дойти' in b.get('text','') for m,b in self.telegram.calls if m=='sendMessage'))
 
-    def test_cancelled_draft_never_posts(self):
-        nonce=self.prepare_draft()
-        self.app.handle(message(111,'/cancel'))
-        self.app.handle(callback(111,'send:'+nonce))
+    async def test_cancelled_draft_never_posts(self):
+        nonce=await self.prepare_draft()
+        await self.app.handle(message(111,'/cancel'))
+        await self.app.handle(callback(111,'send:'+nonce))
         self.assertFalse(self.app.pending_actions)
         self.assertFalse(ActionSite.posts)
 
-    def test_cancel_removes_a_confirmed_reply_still_waiting_for_worker(self):
-        nonce=self.prepare_draft()
-        self.app.handle(callback(111,'send:'+nonce))
+    async def test_cancel_removes_a_confirmed_reply_still_waiting_for_worker(self):
+        nonce=await self.prepare_draft()
+        await self.app.handle(callback(111,'send:'+nonce))
         self.assertIn(111,self.app.pending_actions)
-        self.app.handle(message(111,'/cancel'))
-        self.app.dispatch_features()
+        await self.app.handle(message(111,'/cancel'))
+        await self.app.dispatch_features()
         self.assertFalse(self.app.pending_actions)
         self.assertFalse(ActionSite.posts)
 
-    def test_new_draft_supersedes_previous_confirmation(self):
-        old_nonce=self.prepare_draft()
-        self.app.handle(message(111,'Changed answer'))
-        new_nonce=self.app.states[111]['nonce']
+    async def test_new_draft_supersedes_previous_confirmation(self):
+        old_nonce=await self.prepare_draft()
+        await self.app.handle(message(111,'Changed answer'))
+        new_nonce=(await self.app.get_conversation(111))['nonce']
         self.assertNotEqual(old_nonce,new_nonce)
-        self.app.handle(callback(111,'send:'+old_nonce))
+        await self.app.handle(callback(111,'send:'+old_nonce))
         self.assertFalse(self.app.pending_actions)
-        self.app.handle(callback(111,'send:'+new_nonce))
-        self.app.dispatch_features()
-        self.finish()
+        await self.app.handle(callback(111,'send:'+new_nonce))
+        await self.app.dispatch_features()
+        await self.finish()
         self.assertEqual(ActionSite.posts[0][2]['content'],'Changed answer')
 
-    def test_reply_token_is_not_trusted_as_a_conversation_id(self):
-        self.app.handle(callback(111,'reply:room'))
+    async def test_reply_token_is_not_trusted_as_a_conversation_id(self):
+        await self.app.handle(callback(111,'reply:room'))
         self.assertFalse(self.app.pending_actions)
 
 

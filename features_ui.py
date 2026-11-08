@@ -31,17 +31,17 @@ class FeatureUI:
     def feature_store(self, user):
         return FeatureStore(self.user_path(user['chat_id'], user['storage']) / 'notifications.sqlite3', user['site_user'])
 
-    def feature_panel(self, chat_id, key, keyboard, message_id=None, **values):
+    async def feature_panel(self, chat_id, key, keyboard, message_id=None, **values):
         user = self.catalog.user(chat_id)
         if message_id:
             try:
-                return self.telegram.call('editMessageText', {
+                return await self.telegram.call('editMessageText', {
                     'chat_id': chat_id, 'message_id': message_id,
                     'text': tr(user['language'], key, **values), 'reply_markup': keyboard,
                 })
             except ServiceError:
                 pass
-        return self.send(chat_id, key, keyboard=keyboard, **values)
+        return await self.send(chat_id, key, keyboard=keyboard, **values)
 
     def pref_update(self, chat_id, **values):
         self.catalog.update(chat_id, **values, next_run=0)
@@ -49,7 +49,7 @@ class FeatureUI:
         if job and job.kind == 'poll':
             job.cancel.set()
 
-    def feature_command(self, chat_id, command, argument='', message_id=None):
+    async def feature_command(self, chat_id, command, argument='', message_id=None):
         user = self.catalog.user(chat_id)
         lang = user['language']
         def button(key, data=None):
@@ -59,7 +59,7 @@ class FeatureUI:
                  if user['quiet_start'] >= 0 else tr(lang, 'off'))
         digest = clock_text(user['digest_minute']) if user['digest_enabled'] else tr(lang, 'off')
         if command == 'settings':
-            self.feature_panel(chat_id, 'settings_text', {'inline_keyboard': [
+            await self.feature_panel(chat_id, 'settings_text', {'inline_keyboard': [
                 [button('filters'), button('quiet')], [button('grouping'), button('digest')],
                 [button('timezone'), button('language')],
             ]}, message_id, count=8-len(muted_categories(user)), quiet=quiet,
@@ -70,7 +70,7 @@ class FeatureUI:
             rows = [[{'text': ('☑ ' if key not in muted else '☐ ') + tr(lang, 'cat_' + key),
                       'callback_data': 'filter:' + key}] for key in CATEGORIES]
             rows += [[button('filters_all')], back]
-            self.feature_panel(chat_id, 'filters_text', {'inline_keyboard': rows}, message_id)
+            await self.feature_panel(chat_id, 'filters_text', {'inline_keyboard': rows}, message_id)
         elif command == 'quiet':
             if argument:
                 if argument.lower() == 'off':
@@ -79,15 +79,15 @@ class FeatureUI:
                     parts = argument.split('-')
                     values = [clock(part) for part in parts]
                     if len(values) != 2 or None in values or values[0] == values[1]:
-                        self.send(chat_id, 'quiet_invalid')
+                        await self.send(chat_id, 'quiet_invalid')
                         return True
                     self.pref_update(chat_id, quiet_start=values[0], quiet_end=values[1])
-                return self.feature_command(chat_id, 'quiet', message_id=message_id)
-            self.feature_panel(chat_id, 'quiet_text', {'inline_keyboard': [
+                return await self.feature_command(chat_id, 'quiet', message_id=message_id)
+            await self.feature_panel(chat_id, 'quiet_text', {'inline_keyboard': [
                 [button('quiet_preset', 'quiet_on')], [button('quiet_off')], back,
             ]}, message_id, quiet=quiet, zone=timezone_label(user['timezone_minutes']))
         elif command == 'grouping':
-            self.feature_panel(chat_id, 'grouping_text', {'inline_keyboard': [
+            await self.feature_panel(chat_id, 'grouping_text', {'inline_keyboard': [
                 [button('toggle_grouping', 'grouping_toggle')], back,
             ]}, message_id, state=tr(lang, 'on' if user['grouping'] else 'off'))
         elif command == 'digest':
@@ -97,96 +97,96 @@ class FeatureUI:
                 else:
                     minute = clock(argument)
                     if minute is None:
-                        self.send(chat_id, 'digest_invalid')
+                        await self.send(chat_id, 'digest_invalid')
                         return True
                     self.pref_update(chat_id, digest_enabled=1, digest_minute=minute, digest_since=time.time())
-                return self.feature_command(chat_id, 'digest', message_id=message_id)
-            self.feature_panel(chat_id, 'digest_text', {'inline_keyboard': [
+                return await self.feature_command(chat_id, 'digest', message_id=message_id)
+            await self.feature_panel(chat_id, 'digest_text', {'inline_keyboard': [
                 [button('digest_toggle')], [button('digest_21')], back,
             ]}, message_id, state=digest, zone=timezone_label(user['timezone_minutes']))
         elif command == 'recent':
             if argument in ('5', '10'):
-                self.submit_feature(chat_id, 'recent', {'count': int(argument)})
+                await self.submit_feature(chat_id, 'recent', {'count': int(argument)})
             else:
-                self.feature_panel(chat_id, 'recent_choose', {'inline_keyboard': [
+                await self.feature_panel(chat_id, 'recent_choose', {'inline_keyboard': [
                     [button('recent_5'), button('recent_10')],
                 ]}, message_id)
         elif command == 'summary':
-            self.submit_feature(chat_id, 'summary', {})
+            await self.submit_feature(chat_id, 'summary', {})
         else:
             return False
         return True
 
-    def feature_callback(self, chat_id, action, message_id=None):
+    async def feature_callback(self, chat_id, action, message_id=None):
         user = self.catalog.user(chat_id)
         if not action.startswith(('reply:', 'send:')):
-            self.cancel_input(chat_id)
+            await self.cancel_input(chat_id)
         if action.startswith('filter:') and action[7:] in CATEGORIES:
             muted = muted_categories(user)
             key = action[7:]
             muted.symmetric_difference_update({key})
             self.pref_update(chat_id, muted=json.dumps(sorted(muted)))
-            return self.feature_command(chat_id, 'filters', message_id=message_id)
+            return await self.feature_command(chat_id, 'filters', message_id=message_id)
         if action == 'filters_all':
             self.pref_update(chat_id, muted='[]')
-            return self.feature_command(chat_id, 'filters', message_id=message_id)
+            return await self.feature_command(chat_id, 'filters', message_id=message_id)
         if action in ('quiet_on', 'quiet_off'):
-            return self.feature_command(chat_id, 'quiet', '23:00-08:00' if action == 'quiet_on' else 'off', message_id)
+            return await self.feature_command(chat_id, 'quiet', '23:00-08:00' if action == 'quiet_on' else 'off', message_id)
         if action == 'grouping_toggle':
             self.pref_update(chat_id, grouping=1-int(bool(user['grouping'])))
-            return self.feature_command(chat_id, 'grouping', message_id=message_id)
+            return await self.feature_command(chat_id, 'grouping', message_id=message_id)
         if action in ('digest_toggle', 'digest_21'):
             if action == 'digest_21':
-                return self.feature_command(chat_id, 'digest', '21:00', message_id)
+                return await self.feature_command(chat_id, 'digest', '21:00', message_id)
             self.pref_update(chat_id, digest_enabled=1-int(bool(user['digest_enabled'])), digest_since=time.time())
-            return self.feature_command(chat_id, 'digest', message_id=message_id)
+            return await self.feature_command(chat_id, 'digest', message_id=message_id)
         if action in ('recent_5', 'recent_10'):
-            return self.feature_command(chat_id, 'recent', action.split('_')[1], message_id)
+            return await self.feature_command(chat_id, 'recent', action.split('_')[1], message_id)
         if action.startswith('reply:'):
             token = action[6:]
             if re.fullmatch(r'[0-9a-f]{24}', token):
-                self.cancel_input(chat_id)
-                self.submit_feature(chat_id, 'prepare_reply', {'token': token})
+                await self.cancel_input(chat_id)
+                await self.submit_feature(chat_id, 'prepare_reply', {'token': token})
             else:
-                self.send(chat_id, 'reply_expired')
+                await self.send(chat_id, 'reply_expired')
             return True
         if action.startswith('send:'):
             nonce = action[5:]
-            state = self.states.get(chat_id)
+            state = await self.get_conversation(chat_id)
             if (not state or state['step'] != 'reply_confirm' or state['expires'] < time.time()
                     or not secrets.compare_digest(str(state['nonce']), nonce)
                     or state['storage'] != user['storage']):
-                self.send(chat_id, 'reply_stale')
+                await self.send(chat_id, 'reply_stale')
                 return True
             if chat_id in self.pending_actions or chat_id in self.jobs and self.jobs[chat_id].kind != 'poll':
-                self.send(chat_id, 'request_busy')
+                await self.send(chat_id, 'request_busy')
                 return True
-            self.states.pop(chat_id, None)
-            self.submit_feature(chat_id, 'send_reply', state)
+            await self.clear_conversation(chat_id)
+            await self.submit_feature(chat_id, 'send_reply', state)
             return True
-        return self.feature_command(chat_id, action, message_id=message_id)
+        return await self.feature_command(chat_id, action, message_id=message_id)
 
-    def feature_input(self, chat_id, message):
-        state = self.states.get(chat_id)
+    async def feature_input(self, chat_id, message):
+        state = await self.get_conversation(chat_id)
         if not state or state['step'] not in ('reply_text', 'reply_confirm'):
             return False
         if state['expires'] < time.time() or self.catalog.user(chat_id)['storage'] != state['storage']:
-            self.states.pop(chat_id, None)
-            self.send(chat_id, 'reply_stale')
+            await self.clear_conversation(chat_id)
+            await self.send(chat_id, 'reply_stale')
             return True
-        text = message.get('text', '')
+        text = message.text or ''
         if not text.strip() or len(text.encode('utf-16-le')) // 2 > 4000:
-            self.send(chat_id, 'reply_invalid')
+            await self.send(chat_id, 'reply_invalid')
             return True
         lang = self.catalog.user(chat_id)['language']
         nonce = secrets.token_hex(12)
-        self.states[chat_id] = {**state, 'step': 'reply_confirm', 'text': text, 'nonce': nonce,
-                                'expires': time.time() + 600}
+        await self.set_conversation(chat_id, {**state, 'step': 'reply_confirm', 'text': text, 'nonce': nonce,
+                                'expires': time.time() + 600})
         preview = (f'<b>{html.escape(tr(lang,"reply_confirm_title"))}</b>\n'
                    + escaped_excerpt(tr(lang, 'reply_recipient', name=state['name']), 400)
                    + '\n\n<blockquote>' + escaped_excerpt(text, 2600) + '</blockquote>\n\n'
                    + html.escape(tr(lang, 'reply_full_length', count=len(text))))
-        self.telegram.call('sendMessage', {'chat_id': chat_id, 'text': preview, 'parse_mode': 'HTML',
+        await self.telegram.call('sendMessage', {'chat_id': chat_id, 'text': preview, 'parse_mode': 'HTML',
             'reply_markup': {'inline_keyboard': [[{'text': tr(lang, 'reply_send'), 'callback_data': 'send:' + nonce},
                                                 {'text': tr(lang, 'cancel'), 'callback_data': 'cancel'}]]}})
         return True
@@ -266,7 +266,7 @@ class FeatureUI:
             raise FeatureError('reply_failed')
         return {'name': name, 'participants': sorted(str(person['id']) for person in people)}
 
-    def finish_feature(self, chat_id, result, job):
+    async def finish_feature(self, chat_id, result, job):
         if job.cancel.is_set() or chat_id in self.removing:
             return
         action = result['action']
@@ -274,23 +274,23 @@ class FeatureUI:
             self.catalog.update(chat_id, pending_manual=1, next_run=0)
             if action == 'recent':
                 if result['count']:
-                    self.safe_send(chat_id, 'recent_done', count=result['count'])
+                    await self.safe_send(chat_id, 'recent_done', count=result['count'])
                 else:
-                    self.safe_send(chat_id, 'recent_empty')
+                    await self.safe_send(chat_id, 'recent_empty')
         elif action == 'prepare_reply':
-            self.states[chat_id] = {**result, 'step': 'reply_text', 'expires': time.time() + 600}
-            self.safe_send(chat_id, 'reply_prompt', name=result['name'], keyboard={'inline_keyboard': [[
+            await self.set_conversation(chat_id, {**result, 'step': 'reply_text', 'expires': time.time() + 600})
+            await self.safe_send(chat_id, 'reply_prompt', name=result['name'], keyboard={'inline_keyboard': [[
                 {'text': tr(self.catalog.user(chat_id)['language'], 'cancel'), 'callback_data': 'cancel'}]]})
         elif action == 'send_reply':
-            self.safe_send(chat_id, 'reply_sent', name=result['name'])
+            await self.safe_send(chat_id, 'reply_sent', name=result['name'])
 
-    def feature_error(self, chat_id, action, error):
+    async def feature_error(self, chat_id, action, error):
         if isinstance(error, FeatureError):
-            self.safe_send(chat_id, str(error))
+            await self.safe_send(chat_id, str(error))
         elif action == 'send_reply':
             uncertain = not isinstance(error, ServiceError) or error.status == 0 or error.status >= 500
-            self.safe_send(chat_id, 'reply_uncertain' if uncertain else 'reply_failed')
+            await self.safe_send(chat_id, 'reply_uncertain' if uncertain else 'reply_failed')
         else:
-            self.safe_send(chat_id, 'unavailable')
+            await self.safe_send(chat_id, 'unavailable')
             if isinstance(error, ServiceError) and error.status in (401, 403) and str(error).startswith('Teswirler'):
-                self.poll_error(chat_id, error)
+                await self.poll_error(chat_id, error)
