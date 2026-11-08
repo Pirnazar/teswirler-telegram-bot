@@ -1,0 +1,18 @@
+[Unit]
+Description=Teswirler notifications to Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/teswirler-bot
+ExecStart=%h/teswirler-bot/.venv-public/bin/python -u %h/teswirler-bot/public_bot.py
+Restart=on-failure
+RestartSec=15
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+LimitCORE=0
+
+[Install]
+WantedBy=default.target
