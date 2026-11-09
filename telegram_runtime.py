@@ -101,10 +101,13 @@ class AiogramGateway:
     async def _request(self, method, body):
         try:
             result = await self.bot(self.METHODS[method].model_validate(body or {}))
+            # Serialize only fields received from Telegram. Nested models can
+            # contain aiogram Default sentinels in fields absent from the response.
+            options = {'mode': 'json', 'by_alias': True, 'exclude_none': True, 'exclude_unset': True}
             if isinstance(result, list):
-                return [item.model_dump(mode='json', by_alias=True, exclude_none=True)
+                return [item.model_dump(**options)
                         if hasattr(item, 'model_dump') else item for item in result]
-            return result.model_dump(mode='json', by_alias=True, exclude_none=True) if hasattr(result, 'model_dump') else result
+            return result.model_dump(**options) if hasattr(result, 'model_dump') else result
         except TelegramRetryAfter as error:
             self.blocked_until = time.monotonic() + error.retry_after
             raise ServiceError('Telegram', 429, error.retry_after) from None

@@ -28,6 +28,7 @@ class RecordingSession(BaseSession):
         self.error=None
         self.closed=False
         self.updates=[]
+        self.send_result=None
 
     async def close(self):
         self.closed=True
@@ -39,6 +40,8 @@ class RecordingSession(BaseSession):
         if isinstance(method,GetMe):
             return User(id=bot.id,is_bot=True,first_name='Test bot',username='test_bot')
         if isinstance(method,SendMessage):
+            if self.send_result is not None:
+                return self.send_result
             return Message(message_id=len(self.methods),date=datetime.now(timezone.utc),
                            chat=Chat(id=int(method.chat_id),type='private'),text=method.text,
                            reply_markup=method.reply_markup if isinstance(method.reply_markup, InlineKeyboardMarkup) else None)
@@ -68,6 +71,31 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.session.methods[-1].parse_mode,'HTML')
         self.assertEqual(result['reply_markup']['inline_keyboard'][0][0]['text'],'Open')
         self.assertIsNone(self.bot.default.parse_mode)
+
+    async def test_confirmed_delivery_with_link_preview_options_drains_outbox(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        app = PublicBot(Path(directory.name), self.gateway, FakeSite)
+        self.addAsyncCleanup(app.close)
+        app.catalog.user(111)
+        app.catalog.update(111, storage='a' * 32, site_user='example', status='active')
+        user = app.catalog.user(111)
+        store = app.feature_store(user)
+        try:
+            now = time.time()
+            with store.db:
+                store.queue_summary(user, now-60, now)
+        finally:
+            store.db.close()
+        self.session.send_result = Message.model_validate({
+            'message_id': 42, 'date': int(now), 'chat': {'id': 111, 'type': 'private'},
+            'text': 'Summary', 'link_preview_options': {'is_disabled': True},
+        })
+        first = await app.poll_job(user, threading.Event())
+        second = await app.poll_job(user, threading.Event())
+        self.assertEqual(first[1:4], (1, False, False))
+        self.assertEqual(second[1], 0)
+        self.assertEqual(sum(isinstance(method, SendMessage) for method in self.session.methods), 1)
 
     async def test_network_exception_does_not_expose_credentials(self):
         self.session.error=TelegramNetworkError(method=GetMe(),message='SECRET request URL and password')
